@@ -24,7 +24,7 @@
 
 保留现有类别并补齐：
 
-1. 凭据与本机环境：仅按精确的凭据文件名和扩展名排除 `.env*`、`auth.json`、`credentials*.json`、`token.json`、`tokens.json`、`secrets.json`、私钥和证书；允许 `.env.example` 与 `.env.*.example`。禁止使用 `*token*` 或 `*secret*` 之类宽泛规则，以免误伤 `token-meter/` 和源码文档。
+1. 凭据与本机环境：仅按明确的凭据文件名和扩展名排除 `.env*`、`auth.json`、`credentials.json`、`credentials-*.json`、`*-credentials.json`、`token.json`、`tokens.json`、`secrets.json`、私钥和证书；允许 `.env.example` 与 `.env.*.example`。禁止使用 `credentials*.json`、`*token*` 或 `*secret*` 之类宽泛规则，以免误伤 Schema、示例、`token-meter/` 和源码文档。
 2. 本机覆盖：根 `local/`、`lark-notify.local.json`、`lark-claude/config/*.local.json`。
 3. 运行状态：根 `.tmp/`、`.token-meter-data/`，以及 `lark-claude/data|logs|run`。
 4. Node.js：依赖目录、包管理器缓存、调试日志和构建缓存。
@@ -116,10 +116,10 @@
 
 - `.agents/.token-meter-data/...`、`.agents/.tmp/...`、`.env`、SQLite WAL、`node_modules` 被忽略。
 - `.agents/skills/.../SKILL.md`、三个明确允许的真实配置不被忽略。
-- `.claude/settings.json`、`sessions/`、`plugins/` 被忽略；`CLAUDE.md`、`rules/*.md` 可跟踪。
+- `.claude/settings.json`、`sessions/`、`plugins/` 被忽略；`CLAUDE.md` 可跟踪。分别在 `rules/`、`agents/`、`commands/` 下测试至少两层深的 Markdown 文件可跟踪，同时同目录的 `.json`、`.rules`、`.bak` 和锁文件继续被忽略。
 - `.codex/auth.json`、`config.toml`、`hooks.json`、`rules/default.rules`、数据库和会话被忽略；`AGENTS.md`、`rules/shared.rules` 可跟踪。
 
-`.agents` 的数据库规则必须覆盖 `.db`、`.sqlite`、`.sqlite3`，以及对应的 `-wal`、`-shm`、`-journal` sidecar。
+`.agents` 的数据库规则必须覆盖 `.db`、`.sqlite`、`.sqlite3`，以及对应的 `-wal`、`-shm`、`-journal` sidecar。验收矩阵要逐一测试三个基础扩展名及其三种 sidecar，不能只抽查 WAL。
 
 `.gitignore` 不影响已经进入索引的文件，因此还必须执行：
 
@@ -129,7 +129,7 @@ git ls-files -ci --exclude-standard
 
 三个仓库均要求输出为空。对 `.claude` 与 `.codex` 再将 `git ls-files` 输出与设计白名单比较；除 `.gitignore`、`README.md` 和允许的人工资源外，出现任何路径都视为失败。
 
-对所有已跟踪和暂存内容运行不区分大小写的凭据关键词扫描，至少覆盖 `api_key`、`access_token`、`client_secret`、`app_secret`、`authorization`、`private_key`。每个命中项必须是字段名、占位符或安全文档示例；出现可用值即失败。暂存前还必须完整查看 `git diff --cached`。
+本次实现不暂存文件。使用 `git ls-files --cached --others --exclude-standard` 枚举所有已跟踪及未忽略的未跟踪文件，对这份集合运行不区分大小写的凭据关键词扫描，至少覆盖 `api_key`、`access_token`、`refresh_token`、`client_secret`、`app_secret`、`authorization`、`bearer`、`private_key`、`password`、`cookie`。每个命中项必须是字段名、占位符或安全文档示例；出现可用值即失败。实现阶段使用 `git diff` 和直接读取未跟踪的 `.gitignore` 检查结果；`git diff --cached` 保留为以后真正暂存时的提交前检查。
 
 跨电脑资源 `CLAUDE.md`、`AGENTS.md`、Claude Markdown 资源和 `rules/shared.rules` 不得包含当前用户名、`C:\Users\<实际用户名>`、固定盘符项目路径或安装版本目录。三个现有 `.agents` 部署配置是本次范围内的显式例外；在 machine profile 落地前，它们允许包含机器路径，但不得包含凭据，并且其他电脑不得直接套用。
 
