@@ -24,7 +24,7 @@
 
 保留现有类别并补齐：
 
-1. 凭据与本机环境：仅按明确的凭据文件名和扩展名排除 `.env*`、`auth.json`、`credentials.json`、`credentials-*.json`、`*-credentials.json`、`token.json`、`tokens.json`、`secrets.json`、私钥和证书；允许 `.env.example` 与 `.env.*.example`。禁止使用 `credentials*.json`、`*token*` 或 `*secret*` 之类宽泛规则，以免误伤 Schema、示例、`token-meter/` 和源码文档。
+1. 凭据与本机环境：仅按明确的凭据文件名和扩展名排除 `.env*`、`auth.json`、`credentials.json`、`credentials.local.json`、`credentials.private.json`、`service-account.json`、`service-account-key.json`、`token.json`、`tokens.json`、`secrets.json`、私钥和证书；允许 `.env.example` 与 `.env.*.example`。禁止使用 `credentials*.json`、`credentials-*.json`、`*token*` 或 `*secret*` 之类宽泛规则，以免误伤 Schema、示例、`token-meter/` 和源码文档。
 2. 本机覆盖：根 `local/`、`lark-notify.local.json`、`lark-claude/config/*.local.json`。
 3. 运行状态：根 `.tmp/`、`.token-meter-data/`，以及 `lark-claude/data|logs|run`。
 4. Node.js：依赖目录、包管理器缓存、调试日志和构建缓存。
