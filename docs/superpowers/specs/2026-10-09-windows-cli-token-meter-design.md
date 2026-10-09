@@ -96,7 +96,8 @@
 {
   "schema_version": 1,
   "record_id": "sha256(logical_turn_id|snapshot_hash)",
-  "logical_turn_id": "sha256(codex|session_id|turn_id)",
+  "logical_turn_id": "sha256(computer_scope|user_scope|codex|session_id|turn_id)",
+  "source_cursor": 481,
   "revision": 2,
   "status": "observed_stop",
   "supersedes": "prior-record-id-or-null",
@@ -148,6 +149,10 @@
 - 原始 `total_tokens` 原样保存在 `source_usage.total_tokens`。只有来源语义已知时才生成 `normalized_usage`，不以规范化值冒充上游账单 total。
 - 可见文本估算只填写 `estimated_visible_input_tokens` 或 `estimated_visible_output_tokens`，API 输入、缓存、推理和总量保持 `null`，不得产生与 provider-reported total 可直接比较的合计。
 
+`computer_scope` 和 `user_scope` 使用与运行数据目录相同的、清理非法文件名字符后转小写的名称。这样复制并恢复同一个 session 时，不同机器或用户不会共享 revision 链；`-AllMachines` 的去重和 revision 分组键仍是 `(computer_scope, user_scope, logical_turn_id)`。
+
+`snapshot_hash` 只覆盖 `quality`、`source`、`model`、`source_usage`、`normalized_usage`、`semantics`、`estimate_scope` 和 `unavailable_reason`。哈希前递归按键名序排序，整数用十进制、布尔和 null 用 JSON 字面值、字符串按 JSON 规则转义，输出无空白 UTF-8 JSON；不包含 timestamp、record_id、revision、supersedes、source_cursor 等易变字段。
+
 ## Claude 数据流
 
 ### 状态栏
@@ -170,8 +175,8 @@
 3. 优先使用该 user 记录的稳定 UUID；缺失时使用其时间戳、文件偏移和第一条 assistant message ID 生成 SHA-256 `turn_id`。
 4. 只读取该边界之后、当前 Stop 之前的 assistant 记录，按 API message ID 去重；同一消息的重复持久化项保留最后一项。
 5. 汇总该轮可能包含的多次 provider-reported 模型调用，并标记 `DERIVED_REPORTED`。
-6. 以 `cli + session_id + turn_id` 的 SHA-256 为 `logical_turn_id`，以 `logical_turn_id + 当前汇总快照哈希` 的 SHA-256 为 `record_id`。每次 Stop 都把当时已观察到的完整快照作为 `status = "observed_stop"` 提交，不假设本 hook 能预知同一批次中其他 Stop hook 是否会要求 continuation。
-7. 在全局历史锁内读取该 `logical_turn_id` 的最新记录：若快照哈希相同则视为幂等重试；若快照不同则分配递增 `revision`，设置 `supersedes` 后追加修订记录。这样后续 Stop 能修正先前已提交的部分汇总，历史仍保持只追加。
+6. 以 `computer_scope + user_scope + cli + session_id + turn_id` 的 SHA-256 为 `logical_turn_id`，以 `logical_turn_id + 当前汇总快照哈希` 的 SHA-256 为 `record_id`。Claude 使用当前快照最后一条被计入 assistant 记录的 transcript UTF-8 结束字节偏移作为单调 `source_cursor`。每次 Stop 都把当时已观察到的完整快照作为 `status = "observed_stop"` 提交，不假设本 hook 能预知同一批次中其他 Stop hook 是否会要求 continuation。
+7. 在全局历史锁内读取该 `logical_turn_id` 的整个 revision 链：任何 revision 已有相同 `record_id` 时无条件视为幂等重试；只有 `source_cursor` 严格大于当前有效记录时，才分配递增 `revision`、设置 `supersedes` 并追加修订记录。cursor 相等但 snapshot 不同表示解析不一致，拒绝覆盖并记错误；cursor 更小表示迟到旧快照，直接丢弃。这样 `A -> B -> A` 回放或较旧并发 hook 后取得锁都不会让查询结果回退。
 8. 修复 `history.jsonl` 尾部不完整行后，一次写入完整 JSON 行并 flush；提交成功后更新 `latest/claude/<session-hash>.json`。latest 和历史查询都按 `logical_turn_id` 只选最大 revision，汇总时不得重复计算旧 revision。
 9. 向 stdout 返回 Claude hook 文档支持的 JSON `systemMessage`，逐轮显示本次 Stop 观察到的统计；如果同一用户轮次之后被其他 Stop hook 继续，下一次 Stop 会打印修订值。若受 `disableAllHooks`、`allowManagedHooksOnly` 或 workspace trust 阻止，安装器保持 `configured_unverified`，不得标记为 `hook_invoked`。
 
@@ -184,14 +189,14 @@ Codex CLI `0.153.4` 已支持 `~/.codex/hooks.json` 的 `Stop` command hook。`C
 1. 从 Stop hook stdin 读取文档化的 `transcript_path`、`session_id`、`turn_id`、`last_assistant_message` 和 Stop continuation 标记。
 2. 以 payload 的 `turn_id` 为主键读取 transcript 中同一 turn 的 `token_usage_record`；`last_assistant_message` 只用于防御性确认尾部对应当前 Stop，不用文本内容生成身份。
 3. 在最多 1.5 秒的有界轮询内等待至少一条同 `turn_id` 的 usage 记录并等待文件长度短暂稳定；轮询间隔从 25 ms 退避到 200 ms，总时长必须小于 hook timeout。`task_complete` 若已出现可作为完整性佐证，但不是提交前置条件，因为 Stop hook 本身就是本次观察边界。
-4. 同一轮会产生多条渐进累计记录，只选择本次 Stop 调用时可见的最后一条 `payload.turn_token_usage`；不得选择第一条，也不得逐条相加。
-5. 以 `cli + session_id + turn_id` 生成 `logical_turn_id`，并使用与 Claude 相同的快照哈希、revision 和历史锁事务提交 `DERIVED_REPORTED` 记录，更新 `latest/codex/<session-hash>.json`。如果另一个 Stop hook 随后继续同一 turn，下一次 Stop 追加更高 revision，查询只计最新 revision。
+4. 同一轮会产生多条渐进累计记录，只选择本次 Stop 调用时可见的最后一条 `payload.turn_token_usage`；不得选择第一条，也不得逐条相加。使用该记录的最大 JSONL `ordinal` 作为 `source_cursor`；旧格式修复记录使用其 UTF-8 结束字节偏移。
+5. 以 `computer_scope + user_scope + cli + session_id + turn_id` 生成 `logical_turn_id`，并使用与 Claude 相同的全链 record_id 去重、source_cursor 单调检查、revision 和历史锁事务提交 `DERIVED_REPORTED` 记录，更新 `latest/codex/<session-hash>.json`。如果另一个 Stop hook 随后继续同一 turn，下一次 Stop 只有在 cursor 更大时才追加更高 revision，查询只计最新 revision。
 6. 若轮询结束仍没有同 turn 的 provider usage，立即写入 `UNAVAILABLE` 记录并输出明确的 `[UNAVAILABLE]`，不把上一轮数据误归到当前轮，也不留下只能手工完成的 `[PENDING]`。离线修复若稍后发现该 turn 的 reported usage，可追加一个更高 revision 自动覆盖查询视图。
 7. 向 stdout 返回 Codex hook 文档支持的 JSON `systemMessage`，在 TUI 中逐轮显示本次 Stop 的统计。
 
 `event_msg/token_count/info.last_token_usage` 只表示一次 API 调用且自身没有 turn ID，不能单独形成逐轮记录。旧格式会话只有在能通过 `task_started`/`task_complete` 边界无歧义关联并汇总时才记为 `DERIVED_REPORTED`；否则记为 `UNAVAILABLE`。真实 `0.153.4` 集成测试必须证明 Stop payload 的 `turn_id` 与 `token_usage_record.payload.turn_id` 的关联，并覆盖 `task_complete` 已落盘和未落盘两种顺序。
 
-若 Codex 在写出 `task_complete` 后、Stop hook 成功落盘前崩溃，`Repair-TokenHistory.ps1` 可离线扫描完整 `task_complete` 区间进行补录。没有 `task_complete` 的中断轮默认不计入完成轮次，并在修复报告中列为 abandoned。
+若 Codex 在 Stop observation 或写出 `task_complete` 后、hook 成功落盘前崩溃，`Repair-TokenHistory.ps1` 可离线扫描完整边界进行补录。任何成功提交的 `observed_stop` revision 都是默认历史查询可计量的轮次，不要求额外 `task_complete`；只有既没有 Stop observation、又没有 `task_complete` 的 `task_started` 才在修复报告中列为 abandoned。
 
 Codex 状态栏安装值固定为官方示例支持的 `status_line = ["model-with-reasoning", "context-remaining", "current-dir"]`；其中 `context-remaining` 是状态栏的 Token 上下文信号，详细逐轮拆分由 Stop `systemMessage` 显示。`codex exec --json` 只覆盖非交互调用，不作为交互式 CLI 的主实现。
 
@@ -206,7 +211,7 @@ Codex 状态栏安装值固定为官方示例支持的 `status_line = ["model-wi
 3. 在两个 CLI 的现有 `Stop` 列表中追加可由命令路径唯一识别的 Token hook；重复安装检测到相同命令时跳过，不生成重复项。
 4. Claude 已有不同 `statusLine` 时默认报冲突并保持原值；只有用户显式传入 `-ReplaceClaudeStatusLine` 才替换。ownership manifest 记录原节点、原节点是否存在、原值哈希和本安装器写入后的哈希。
 5. Codex `config.toml` 只定向管理 `[tui]` 下的 `status_line`，安装值固定为 `['model-with-reasoning', 'context-remaining', 'current-dir']`。编辑器识别普通 `[tui]` table、顶层 `tui.status_line` dotted key 和单行/多行数组；若发现 quoted table/key、duplicate definition、inline table 或无法可靠判定的语法，拒绝自动修改并报告用 `/statusline` 手动设置。
-6. TOML 编辑只替换已识别的目标值或在明确的 `[tui]` table 末尾插入，其他字节和注释保持不变。候选文件放进临时 `CODEX_HOME`，执行有超时的 `codex --strict-config doctor --json`；只解析输出中的 `checks.config.load.status` 并要求其为 `ok`，忽略因临时目录没有认证、网络或交互终端而产生的整体非零退出码及其他诊断。该命令只证明 TOML 能被当前版本加载，不能证明 status-line identifier 的语义；因此安装器只写入官方已知常量，不接受任意 identifier。
+6. TOML 编辑只替换已识别的目标值或在明确的 `[tui]` table 末尾插入，其他字节和注释保持不变。候选文件放进临时 `CODEX_HOME`，执行有超时的 `codex --strict-config doctor --json`；stdout 必须能解析为 JSON，并使用 PowerShell `$report.checks.'config.load'.status` 精确读取含点号的键，要求其为 `ok`。忽略因临时目录没有认证、网络或交互终端而产生的整体非零退出码及其他诊断。该命令只证明 TOML 能被当前版本加载，不能证明 status-line identifier 的语义；因此安装器只写入官方已知常量，不接受任意 identifier。
 7. 对配置的写入使用同目录临时文件、继承原文件 ACL，并以原子替换完成。安装器会在内存中解析整个 Claude JSON，但把 `env` 等非目标值视为不透明数据：不比较、不记录、不传输，也不创建包含全量配置的持久备份。
 8. manifest 只保存本方案拥有的节点路径、安装前目标节点内容、安装后哈希和安装时间；不保存 `env`、provider、认证或其他无关配置。
 9. 创建当前 `<computer>/<user>` 数据目录并运行不发模型请求的离线自测。此时安装状态为 `configured_unverified`；任一 CLI 的下一次正常真实回合成功执行 hook 并返回 `systemMessage` 后，该 CLI 单独标记为 `hook_invoked`。程序不能自行断言用户实际看见了消息；`Test-TokenMeter.ps1 -ConfirmVisible claude|codex` 只在用户确认后记录 `user_confirmed_visible`。
@@ -254,11 +259,12 @@ Codex 状态栏安装值固定为官方示例支持的 `status_line = ["model-wi
 - Codex `0.153.4` 同一 turn 的多条渐进 `token_usage_record`，确认 Stop payload 的 `turn_id` 只采用当前 Stop 边界前最后一个累计值；分别覆盖 `task_complete` 已落盘和未落盘。
 - 部分 UTF-8/JSONL 行、文件截断/轮转、缺少 `task_complete` 的 abandoned turn 和修复工具重跑。
 - `PROVIDER_REPORTED`、`DERIVED_REPORTED`、`ESTIMATED_VISIBLE_TEXT`、`UNAVAILABLE` 的显示和序列化。
-- Claude 与 Codex hook 并发追加、两个同类 hook 同时运行、同时存在多个 CLI 会话时，每行仍可解析且同一快照不重复；覆盖同一 logical turn 的后续 Stop 产生更高 revision、查询只计最新 revision、“完整行已追加但状态文件尚未更新即崩溃”和“尾部只写入半行”四种情况。
-- 用户名、计算机名和用户目录含空格或发生变化后无硬编码路径。
+- Claude 与 Codex hook 并发追加、两个同类 hook 同时运行、同时存在多个 CLI 会话时，每行仍可解析且同一快照不重复；覆盖同一 logical turn 的后续 Stop 产生更高 revision、`A -> B -> A` 迟到回放、新快照先取得锁而旧快照后取得锁、cursor 相等但 hash 不同、查询只计最新 revision、“完整行已追加但状态文件尚未更新即崩溃”和“尾部只写入半行”。
+- 用户名、计算机名和用户目录含空格或发生变化后无硬编码路径；不同机器/用户使用相同 session_id 和 turn_id 时仍形成独立 revision 链。
 - 顶层 CLI、Desktop/IDE、guardian 和 subagent fixture 的默认过滤正确。
 - 已有 status line、已有 Stop hooks、嵌入敏感 env、安装后再次编辑配置、重复安装和冲突卸载。
 - 配置处理日志和错误日志不披露敏感值；原文件 ACL 在写入后保持。
+- `codex --strict-config doctor --json` 即使整体退出非零，stdout 仍须可解析，并通过 `$report.checks.'config.load'.status` 验证候选配置。
 - 离线安装结束时明确报告 `configured_unverified`；在真实 Claude Code `2.1.252` 和 Codex CLI `0.153.4` 的下一次正常回合验证 Stop hook 被调用并返回 `systemMessage`，写入 `hook_invoked`。只有用户确认屏幕可见后才写 `user_confirmed_visible`。专门发起 smoke turn 会消耗 Token，只能由用户显式执行。
 - 安装和卸载不会破坏原有 Claude hooks、Codex hooks、Codex `notify` 或 provider 配置。
 - `git check-ignore -v .token-meter-data/.../history.jsonl` 验证运行数据被排除。
