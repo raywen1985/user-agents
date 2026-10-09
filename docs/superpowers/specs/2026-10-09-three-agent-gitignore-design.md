@@ -24,7 +24,7 @@
 
 保留现有类别并补齐：
 
-1. 凭据与本机环境：`.env*`、认证文件、Token、Secret、私钥和证书；允许 `.env.example` 与 `.env.*.example`。
+1. 凭据与本机环境：仅按精确的凭据文件名和扩展名排除 `.env*`、`auth.json`、`credentials*.json`、`token.json`、`tokens.json`、`secrets.json`、私钥和证书；允许 `.env.example` 与 `.env.*.example`。禁止使用 `*token*` 或 `*secret*` 之类宽泛规则，以免误伤 `token-meter/` 和源码文档。
 2. 本机覆盖：根 `local/`、`lark-notify.local.json`、`lark-claude/config/*.local.json`。
 3. 运行状态：根 `.tmp/`、`.token-meter-data/`，以及 `lark-claude/data|logs|run`。
 4. Node.js：依赖目录、包管理器缓存、调试日志和构建缓存。
@@ -46,13 +46,37 @@
 - `.gitignore`
 - `README.md`
 - `CLAUDE.md`
-- `rules/**`
-- `agents/**`
-- `commands/**`
+- `rules/**/*.md`
+- `agents/**/*.md`
+- `commands/**/*.md`
+
+实现必须按以下顺序处理父目录遍历和文件类型白名单；不能只写 `!/rules/**` 之类宽泛反向规则：
+
+```gitignore
+/*
+!/.gitignore
+!/README.md
+!/CLAUDE.md
+
+!/rules/
+/rules/**
+!/rules/**/
+!/rules/**/*.md
+
+!/agents/
+/agents/**
+!/agents/**/
+!/agents/**/*.md
+
+!/commands/
+/commands/**
+!/commands/**/
+!/commands/**/*.md
+```
 
 不允许跟踪完整 `settings.json`。Hook 由 `.agents` 中的安装脚本幂等维护。`skills/` 继续以 `.agents/skills` 为单一来源，不在本仓库重复跟踪。
 
-因此 `history.jsonl`、`projects/`、`sessions/`、`plugins/`、`file-history/`、`tasks/`、备份、锁文件和其他未来新增的运行状态都会默认被忽略。
+因此 `history.jsonl`、`projects/`、`sessions/`、`plugins/`、`file-history/`、`tasks/`、备份、锁文件和其他未来新增的运行状态都会默认被忽略。白名单目录中的非 Markdown 文件也默认忽略；Markdown 仍须在暂存前人工审查内容。
 
 ## `.codex` 规则
 
@@ -62,6 +86,19 @@
 - `README.md`
 - `AGENTS.md`
 - `rules/shared.rules`
+
+实现必须使用以下顺序，保证可以遍历 `rules/`，同时继续忽略同目录中的 `default.rules`：
+
+```gitignore
+/*
+!/.gitignore
+!/README.md
+!/AGENTS.md
+
+!/rules/
+/rules/*
+!/rules/shared.rules
+```
 
 `rules/default.rules` 是 Codex 自动积累的本机授权记录，包含绝对路径和已批准命令，必须保持忽略。只有人工审查并明确命名的 `rules/shared.rules` 可以共享。
 
@@ -81,6 +118,20 @@
 - `.agents/skills/.../SKILL.md`、三个明确允许的真实配置不被忽略。
 - `.claude/settings.json`、`sessions/`、`plugins/` 被忽略；`CLAUDE.md`、`rules/*.md` 可跟踪。
 - `.codex/auth.json`、`config.toml`、`hooks.json`、`rules/default.rules`、数据库和会话被忽略；`AGENTS.md`、`rules/shared.rules` 可跟踪。
+
+`.agents` 的数据库规则必须覆盖 `.db`、`.sqlite`、`.sqlite3`，以及对应的 `-wal`、`-shm`、`-journal` sidecar。
+
+`.gitignore` 不影响已经进入索引的文件，因此还必须执行：
+
+```powershell
+git ls-files -ci --exclude-standard
+```
+
+三个仓库均要求输出为空。对 `.claude` 与 `.codex` 再将 `git ls-files` 输出与设计白名单比较；除 `.gitignore`、`README.md` 和允许的人工资源外，出现任何路径都视为失败。
+
+对所有已跟踪和暂存内容运行不区分大小写的凭据关键词扫描，至少覆盖 `api_key`、`access_token`、`client_secret`、`app_secret`、`authorization`、`private_key`。每个命中项必须是字段名、占位符或安全文档示例；出现可用值即失败。暂存前还必须完整查看 `git diff --cached`。
+
+跨电脑资源 `CLAUDE.md`、`AGENTS.md`、Claude Markdown 资源和 `rules/shared.rules` 不得包含当前用户名、`C:\Users\<实际用户名>`、固定盘符项目路径或安装版本目录。三个现有 `.agents` 部署配置是本次范围内的显式例外；在 machine profile 落地前，它们允许包含机器路径，但不得包含凭据，并且其他电脑不得直接套用。
 
 最后检查三个 `.gitignore` 的编码和换行，不暂存、不提交、不推送实现文件。
 
