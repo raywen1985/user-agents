@@ -75,12 +75,12 @@
 {
   "statusLine": {
     "type": "command",
-    "command": "cmd.exe /d /c \"\"%USERPROFILE%\\.agents\\token-meter\\Invoke-ClaudeStatusLine.cmd\"\""
+    "command": "cmd.exe /d /s /c call \"%USERPROFILE%\\.agents\\token-meter\\Invoke-ClaudeStatusLine.cmd\""
   }
 }
 ```
 
-入口文件内部使用：
+`call` 明确把引号内路径作为批处理文件执行，避免 Claude/Codex 的外层 shell 再次解析 `/c \"\"...\"\"` 时误启动交互式 CMD。入口文件内部使用：
 
 ```bat
 @powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%USERPROFILE%\.agents\token-meter\ClaudeStatusLine.ps1"
