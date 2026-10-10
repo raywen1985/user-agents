@@ -1,0 +1,128 @@
+# Credentials and machine-local environment
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.*.example
+**/auth.json
+**/credentials.json
+**/credentials.local.json
+**/credentials.private.json
+**/service-account.json
+**/service-account-key.json
+**/token.json
+**/tokens.json
+**/secrets.json
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+
+# Machine-local overrides
+/local/
+/lark-notify.local.json
+/lark-claude/config/*.local.json
+
+# Generated design and implementation planning artifacts
+/docs/superpowers/
+
+# Runtime state
+/.tmp/
+/.token-meter-data/
+*.log
+*.log.*
+*.pid
+*.pid.lock
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.sqlite3-journal
+/lark-claude/data/
+/lark-claude/logs/
+/lark-claude/run/
+
+# Node.js dependencies and caches
+node_modules/
+.npm/
+.pnpm-store/
+*.tgz
+.yarn/cache/
+.yarn/unplugged/
+.yarn/install-state.gz
+.pnp.*
+*.tsbuildinfo
+.turbo/
+.vite/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python dependencies and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.ipynb_checkpoints/
+
+# Build and test output
+build/
+dist/
+out/
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+*.lcov
+.nyc_output/
+.cache/
+.parcel-cache/
+.next/
+.nuxt/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.DS_Store
+Thumbs.db
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Temporary and backup files
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*~
+
+# Intentionally track the real deployment configs below. This private repo
+# must still be checked for credentials before commits:
+# - /lark-notify.json
+# - /lark-claude/config/gateway.json
+# - /lark-claude/config/projects.json
+
