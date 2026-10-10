@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createCodexExecutableResolver } from "./codex-executable.mjs";
 import { loadConfig, projectRoot } from "./config.mjs";
 import { ClaudeExecutor } from "./executors/claude.mjs";
 import { CodexExecutor } from "./executors/codex.mjs";
@@ -33,6 +34,10 @@ store.recoverInterrupted();
 const messenger = new LarkMessenger({ executable: gateway.executables.larkCli, recipientOpenId: gateway.recipientOpenId });
 const listener = new LarkListener({ executable: gateway.executables.larkCli });
 const router = new ClaudeRouter({ executable: gateway.executables.claude, model: gateway.routerModel, timeoutMs: gateway.routerTimeoutMs });
+const codexExecutable = createCodexExecutableResolver({
+  configured: gateway.executables.codex,
+  onSelection: ({ executable, source }) => logger.info("Codex 可执行文件已解析", { executable, source }),
+});
 
 let flushing = null;
 async function flushOutbox() {
@@ -75,7 +80,8 @@ const scheduler = new Scheduler({
       summaryLength: gateway.summaryLength,
     }),
     codex: new CodexExecutor({
-      executable: gateway.executables.codex,
+      resolveExecutable: () => codexExecutable.resolve(),
+      invalidateExecutable: (executable) => codexExecutable.invalidate(executable),
       timeoutMs: gateway.workerTimeoutMs,
       summaryLength: gateway.summaryLength,
     }),

@@ -141,24 +141,61 @@ function agentText(item) {
   return null;
 }
 
-export class CodexExecutor {
-  constructor({ executable, timeoutMs, summaryLength = 500 }) {
-    this.executable = executable;
-    this.timeoutMs = timeoutMs;
-    this.summaryLength = summaryLength;
-  }
+function isInitialSpawnEnoent(error) {
+  return error?.code === "ENOENT" || /\bENOENT\b/.test(error?.message || "");
+}
 
-  async run({ session, content, signal, onApproval, onNativeId }) {
-    const client = new CodexRpcClient(this.executable, session.project_path);
-    let turnId = null;
-    let latestAgentText = "";
-    let timeout;
+export async function createInitializedCodexClient({
+  cwd,
+  resolveExecutable,
+  invalidateExecutable = () => {},
+  clientFactory = (executable, clientCwd) => new CodexRpcClient(executable, clientCwd),
+}) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const resolved = await resolveExecutable();
+    const selection = typeof resolved === "string"
+      ? { executable: resolved, source: "explicit" }
+      : resolved;
+    const client = clientFactory(selection.executable, cwd);
     try {
       await client.request("initialize", {
         clientInfo: { name: "lark-claude-gateway", version: "0.1.0" },
         capabilities: { experimentalApi: true },
       });
       client.notify("initialized", {});
+      return { client, selection };
+    } catch (error) {
+      client.close();
+      const retryable = attempt === 0 && selection.source !== "explicit" && isInitialSpawnEnoent(error);
+      if (!retryable) throw error;
+      await invalidateExecutable(selection.executable);
+    }
+  }
+  throw new Error("Codex App Server 初始化失败");
+}
+
+export class CodexExecutor {
+  constructor({ executable, resolveExecutable, invalidateExecutable, clientFactory, timeoutMs, summaryLength = 500 }) {
+    if (!resolveExecutable && !executable) throw new Error("Codex executable resolver is required");
+    this.resolveExecutable = resolveExecutable || (async () => ({ executable, source: "explicit" }));
+    this.invalidateExecutable = invalidateExecutable || (() => {});
+    this.clientFactory = clientFactory;
+    this.timeoutMs = timeoutMs;
+    this.summaryLength = summaryLength;
+  }
+
+  async run({ session, content, signal, onApproval, onNativeId }) {
+    let client;
+    let turnId = null;
+    let latestAgentText = "";
+    let timeout;
+    try {
+      ({ client } = await createInitializedCodexClient({
+        cwd: session.project_path,
+        resolveExecutable: this.resolveExecutable,
+        invalidateExecutable: this.invalidateExecutable,
+        clientFactory: this.clientFactory,
+      }));
       const threadParams = {
         cwd: session.project_path,
         approvalPolicy: "untrusted",
@@ -239,7 +276,7 @@ export class CodexExecutor {
       };
     } finally {
       if (timeout) clearTimeout(timeout);
-      client.close();
+      client?.close();
     }
   }
 }

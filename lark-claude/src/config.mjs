@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { validateCodexExecutableConfig } from "./codex-executable.mjs";
 
 export const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -32,8 +33,10 @@ export function loadConfig() {
   if (!Array.isArray(gateway.allowedOpenIds) || gateway.allowedOpenIds.length === 0) {
     throw new Error("allowedOpenIds must contain at least one open_id");
   }
+  validateCodexExecutableConfig(gateway.executables?.codex);
   for (const [name, executable] of Object.entries(gateway.executables || {})) {
-    if (!path.isAbsolute(executable) || !fs.existsSync(executable)) {
+    if (name === "codex") continue;
+    if (typeof executable !== "string" || !path.isAbsolute(executable) || !fs.existsSync(executable)) {
       throw new Error(`Executable ${name} was not found: ${executable}`);
     }
   }

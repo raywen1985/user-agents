@@ -9,7 +9,11 @@
 - `allowedOpenIds`：允许控制网关的飞书用户 `open_id` 列表。
 - `recipientOpenId`：状态与结果接收人的 `open_id`。
 - `routerModel` / `workerModel`：Claude 路由和执行模型。
-- `executables`：Node、lark-cli、Claude、Codex 的绝对路径。
+- `executables`：Node、lark-cli、Claude 使用绝对路径。Codex 可使用绝对
+  `codex.exe` 路径，或设置为 `auto`。`auto` 会在每次 Codex 任务启动前
+  优先发现 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`，找不到可用
+  桌面版本时回退到当前架构的默认用户级 npm 安装；自定义 npm prefix 请
+  配置明确的绝对路径。候选文件必须通过 `app-server --help` 能力预检。
 
 `config/projects.json`：登记允许操作的项目。每项必须包含唯一 `alias`、绝对 `path` 和可选 `aliases`。消息里的任意路径不会自动成为工作目录，必须先在这里登记。
 
