@@ -22,8 +22,8 @@
 /lark-notify.local.json
 /lark-claude/config/*.local.json
 
-# Generated design and implementation planning artifacts
-/docs/superpowers/
+# Generated design and implementation planning artifacts at any depth
+**/docs/superpowers/
 
 # Runtime state
 /.tmp/
