@@ -1,0 +1,5 @@
+data/
+logs/
+run/
+*.sqlite-shm
+*.sqlite-wal

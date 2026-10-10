@@ -1,0 +1,14 @@
+{
+  "name": "lark-claude-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/gateway.mjs",
+    "status": "node src/cli.mjs status",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

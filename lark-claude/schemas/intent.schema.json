@@ -1,0 +1,57 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": [
+        "new",
+        "continue",
+        "status",
+        "list",
+        "cancel",
+        "approve",
+        "reject",
+        "help",
+        "clarify",
+        "unknown"
+      ]
+    },
+    "executor": {
+      "type": ["string", "null"],
+      "enum": ["codex", "claude", null]
+    },
+    "project_alias": {
+      "type": ["string", "null"]
+    },
+    "session_ref": {
+      "type": ["string", "null"]
+    },
+    "session_name": {
+      "type": ["string", "null"]
+    },
+    "request_ref": {
+      "type": ["string", "null"]
+    },
+    "content": {
+      "type": ["string", "null"]
+    },
+    "needs_clarification": {
+      "type": "boolean"
+    },
+    "clarification": {
+      "type": ["string", "null"]
+    }
+  },
+  "required": [
+    "action",
+    "executor",
+    "project_alias",
+    "session_ref",
+    "session_name",
+    "request_ref",
+    "content",
+    "needs_clarification",
+    "clarification"
+  ]
+}
