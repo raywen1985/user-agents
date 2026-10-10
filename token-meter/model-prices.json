@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "currency": "USD",
+  "unit_tokens": 1000000,
+  "source_url": "https://api-docs.deepseek.com/quick_start/pricing",
+  "verified_on": "2026-10-10",
+  "models": [
+    {
+      "id": "deepseek-v4.1-flash",
+      "official_model": "deepseek-flash",
+      "display_name": "DeepSeek V4.1 Flash",
+      "aliases_exact": [
+        "deepseekv4flash",
+        "deepseek-flash",
+        "deepseek-v4-flash"
+      ],
+      "aliases_regex": [
+        "^deepseek-v4-1-flash(?:-[0-9]{6})?$"
+      ],
+      "rates": {
+        "off_peak": {
+          "fresh_input_usd_per_million": "0.15",
+          "cache_read_usd_per_million": "0.003",
+          "cache_write_usd_per_million": "0.15",
+          "output_usd_per_million": "0.60"
+        },
+        "peak": {
+          "fresh_input_usd_per_million": "0.30",
+          "cache_read_usd_per_million": "0.006",
+          "cache_write_usd_per_million": "0.30",
+          "output_usd_per_million": "1.20"
+        }
+      },
+      "cache_write_rule": "use_cache_miss_rate"
+    },
+    {
+      "id": "deepseek-v4-pro",
+      "official_model": "deepseek-v4-pro",
+      "display_name": "DeepSeek V4 Pro",
+      "aliases_exact": [
+        "deepseekv4pro",
+        "deepseek-v4-pro"
+      ],
+      "aliases_regex": [
+        "^deepseek-v4-pro(?:-[0-9]{4})?$"
+      ],
+      "rates": {
+        "off_peak": {
+          "fresh_input_usd_per_million": "0.66",
+          "cache_read_usd_per_million": "0.022",
+          "cache_write_usd_per_million": "0.66",
+          "output_usd_per_million": "1.98"
+        },
+        "peak": {
+          "fresh_input_usd_per_million": "1.32",
+          "cache_read_usd_per_million": "0.044",
+          "cache_write_usd_per_million": "1.32",
+          "output_usd_per_million": "3.96"
+        }
+      },
+      "cache_write_rule": "use_cache_miss_rate"
+    }
+  ]
+}
