@@ -56,7 +56,9 @@ All generated state lives under the target repository's Git directory:
 |- context.json
 |- plan.json
 |- state.json
-|- message.txt
+|- lock
+|- messages/
+|  `- <launch-id>.txt
 `- backup/
 ```
 
@@ -75,6 +77,8 @@ The context records:
 
 The plan records ordered groups. Each group includes a stable ID, intent, paths, message, dependencies, validation commands, state, and the hashes observed when the plan was saved.
 
+State-changing actions acquire an exclusive, worktree-specific lock. JSON state is written to a new file, flushed, and atomically replaced. A normalization journal is flushed before each file write and records the backup path, original hash, and intended result. Startup recovers an interrupted write from that journal before any new operation. `Clear` refuses to remove backups or journals while recovery or a launch confirmation is pending.
+
 ## 5. Commands
 
 `CommitToolkit.ps1` exposes explicit actions:
@@ -83,7 +87,7 @@ The plan records ordered groups. Each group includes a stable ID, intent, paths,
 CommitToolkit.ps1 -Action Analyze   -Repository <path> [-OutputPath <path>]
 CommitToolkit.ps1 -Action Normalize -Repository <path> [-Extensions <list>] [-DryRun]
 CommitToolkit.ps1 -Action SavePlan  -Repository <path> -PlanPath <path>
-CommitToolkit.ps1 -Action OpenNext  -Repository <path> [-Validation light|auto|full|none] [-DryRun]
+CommitToolkit.ps1 -Action OpenNext  -Repository <path> [-Validation light|auto|full|none] [-ValidationApprovalId <id>] [-DryRun]
 CommitToolkit.ps1 -Action Status    -Repository <path>
 CommitToolkit.ps1 -Action Clear     -Repository <path>
 ```
@@ -103,6 +107,8 @@ Every action returns a stable JSON envelope on stdout:
 
 Human diagnostics go to stderr. Secret values must be redacted from both streams.
 
+`SavePlan` accepts only the documented versioned JSON schema. It canonicalizes every path and rejects paths outside the worktree, duplicate or overlapping group membership, paths absent from the captured change set, ignored paths, stale hashes, invalid dependency graphs, directories standing in for file selections, and untracked nested repositories. Symlinks, junctions, and other reparse points are never normalization targets. A tracked submodule gitlink is represented as one atomic path and is not traversed.
+
 ## 6. Repository Inspection
 
 Use NUL-delimited Git output where available. Prefer:
@@ -115,6 +121,10 @@ Use NUL-delimited Git output where available. Prefer:
 - `git rev-parse` for root, Git directory, branch, and HEAD.
 
 Do not parse localized, human-formatted `git status` output.
+
+Every Git inspection is invoked with optional locking and filesystem monitors disabled (`git --no-optional-locks -c core.fsmonitor=false ...`, and `GIT_OPTIONAL_LOCKS=0` for child processes). Child environments remove fsmonitor-related overrides. Diff-family commands always pass `--no-ext-diff --no-textconv`; child environments remove `GIT_EXTERNAL_DIFF` and related override variables. Analysis reads repository blobs with plumbing commands and worktree files with byte APIs. It never invokes hooks or clean, smudge, process, textconv, external diff, or fsmonitor programs. Resolve the worktree-specific index with `git rev-parse --git-path index`, hash its bytes before and after every action, and fail if the hash changes. Any staged entry is an unconditional stop for `Normalize`, `SavePlan`, and `OpenNext`; this version has no mixed-index workflow.
+
+On Windows PowerShell 5.1 and PowerShell 7, capture native Git stdout as bytes through `System.Diagnostics.Process` redirected base streams, then decode using the explicit encoding required by that command. Do not rely on the host console code page or PowerShell's native pipeline decoding. JSON state is UTF-8 without BOM; TortoiseGit message files are UTF-8 with BOM for compatibility. Tests assert these byte-level contracts on both hosts.
 
 Treat submodules and nested repositories as atomic path entries. Do not descend into them unless the user separately invokes the skill in that repository.
 
@@ -133,6 +143,8 @@ The first analysis returns metadata rather than full patches:
 
 The complete manifest is written to `context.json`. Stdout returns bounded summaries and IDs. When grouping remains ambiguous, the skill requests a focused expansion for selected IDs using a small-context patch (normally `--unified=1`) with explicit byte and line limits.
 
+Before any patch text is written to disk or emitted to stdout, stderr, logs, or model context, scan it for secret patterns. Added or untracked content can block a commit; all displayed context is redacted. Findings contain only path, line number, rule ID, confidence, and disposition, never the matched value. False positives are waived only by an explicit, hash-bound exception in the plan; a changed line invalidates the exception.
+
 For very large change sets, summarize by directory and extension first, then expand only candidate themes. Do not stream large generated files, binaries, or complete repository diffs into model context.
 
 The performance test compares compact output size with a full patch over synthetic repositories. Compact mode must remain bounded and materially smaller, while retaining enough path metadata to form themes.
@@ -149,6 +161,8 @@ The default normalization allowlist is:
 
 Repository attributes and configuration can narrow or extend this list. Never treat extension alone as proof that a file is safe to decode.
 
+The allowlist means "eligible for inspection," not "eligible for every rewrite." Each rewrite also requires a proof adapter for the file type and change shape. Files without an applicable proof adapter are reported and left untouched.
+
 ## 9. Safe Diff Normalization
 
 Normalization is transactional and runs before grouping.
@@ -157,7 +171,7 @@ Normalization is transactional and runs before grouping.
 
 - Resolve the repository and base HEAD.
 - Refuse conflicted files and active history operations.
-- Preserve the Git index exactly; if staged changes exist, stop by default and explain that the user must resolve the staged state manually.
+- Preserve the Git index exactly; if any staged change exists, stop unconditionally and explain that this version requires a clean index.
 - Skip binary, LFS, submodule, generated, ignored, oversized, invalidly encoded, or ambiguous files.
 - Store the original bytes and hash before changing a file.
 
@@ -170,27 +184,38 @@ Apply formatting policy in this order:
 3. the base blob's encoding, BOM, final-newline state, and dominant line ending;
 4. no automatic change when the preceding sources do not establish a safe choice.
 
-### 9.3 Allowed Changes
+### 9.3 Proof Adapters and Allowed Changes
 
-- Preserve the original encoding and BOM unless repository policy explicitly requires another encoding.
-- Correct mixed line endings or an accidental whole-file LF/CRLF conversion to the established target style.
-- For an existing tracked file, generate a zero-context patch and identify independent hunks whose added and removed payload consists only of blank or whitespace-only lines. Reverse only those hunks to the base form.
-- Leave a hunk untouched when whitespace noise and semantic changes appear together.
-- Remove trailing whitespace only when applicable repository policy explicitly enables `trim_trailing_whitespace`.
-- Preserve the base final-newline state for existing files. For new files, apply `insert_final_newline` only when explicitly configured.
-- Do not normalize a new file without an explicit repository policy.
+Normalization is conservative and change-local. Preserve encoding and BOM. Never rewrite through a symlink or reparse point. Automatic changes require one of these proofs:
+
+1. **Exact restoration:** if the entire current change is encoding, BOM, line-ending, final-newline, or whitespace noise, restore the tracked file to its exact base bytes. This is always safe because it removes the complete worktree change.
+2. **Unchanged-line EOL restoration:** align base and current content by byte-stable non-newline content. Restore the original terminator only on unchanged base lines. Never alter the terminator of a new or edited line under this proof. Format policy alone does not prove that a newline is outside a data-bearing region. Ambiguous alignments are skipped.
+3. **Grammar proof:** reverse an independent blank/whitespace-only hunk only when a format-specific adapter proves that every affected byte is grammar trivia outside strings, raw strings, interpolated/template strings, character literals, comments, heredocs, preprocessor/directive-sensitive regions, XML text nodes, and other data-bearing regions. The adapter must produce the same significant token stream before and after and reject lexical errors.
+4. **Data-model proof:** JSON may be parsed before and after with duplicate-key detection and compared as an ordered token/value model. XML changes require an explicit repository whitespace policy or schema proving element-only content; absent that evidence, whitespace text nodes are data and are not changed.
+
+The first implementation must provide these adapters and change shapes:
+
+- all tracked regular text files: exact restoration and unchanged-base-line EOL restoration only;
+- C#: independent blank-line-only hunks classified as trivia by a conservative lexer; raw, interpolated, verbatim, and ordinary strings, character literals, comments, directives, and lexically invalid regions are skipped;
+- Lua: independent blank-line-only hunks classified as trivia by a conservative lexer; quoted strings, all levels of long strings/comments, comments, and lexically invalid regions are skipped;
+- JSON: whitespace-only changes accepted only when strict parses with duplicate-key detection produce the same ordered token/value model;
+- XML: whitespace-only changes accepted only when a repository-provided schema or explicit path policy proves element-only content; DTDs and mixed/unknown content are skipped.
+
+Other allowlisted formats receive inspection, exact restoration, and unchanged-base-line EOL restoration only in version 1. Markdown trailing spaces and blank lines, shell heredocs, JavaScript/TypeScript templates and ASI-sensitive boundaries, shader preprocessor regions, and all other unrecognized data-bearing regions are mandatory skips.
+
+Trailing whitespace is removed only when repository policy explicitly enables it **and** the applicable proof adapter classifies it as non-data trivia. `trim_trailing_whitespace` alone is not sufficient for Markdown hard breaks or literal content. Preserve the base final-newline state for existing files. For new files, normalize only with explicit repository policy and a successful format proof. Mixed semantic/whitespace hunks and all ambiguous cases remain untouched.
 
 ### 9.4 Verification and Rollback
 
 After each file:
 
 - decode it again under the same encoding;
-- ensure non-whitespace semantic tokens and binary classification did not change unexpectedly;
+- rerun the applicable proof adapter and require its exact invariant;
 - confirm the Git index hash is unchanged;
 - regenerate the diff;
 - record the reduced lines and hunks.
 
-If any assertion fails, restore the original bytes for that file and return a warning. Never partially rewrite a file after an error.
+The transaction boundary is one file. Journal intent before writing, use same-directory atomic replacement, then mark that file complete. If any assertion fails, restore its exact original bytes and return a warning. A later file failure does not roll back already verified files, but the report lists every completed file. Startup recovery restores any file whose journal entry lacks a completion marker. Never partially rewrite a file after an error.
 
 ## 10. Commit Grouping
 
@@ -228,25 +253,35 @@ Messages explain what changed and why. They do not list filenames and do not add
 
 `OpenNext` accepts `light`, `auto`, `full`, or `none`.
 
-Always perform these non-destructive checks unless explicitly disabled:
+The mode controls only optional lint, build, and test depth. `none` skips those optional validators; it does not disable the mandatory safety gate. The following checks always run and cannot be overridden:
 
 - unresolved conflicts and conflict markers;
 - staged-index safety;
 - suspicious credential and private-key patterns, with redacted output;
 - path and file-hash drift;
 - JSON parsing for changed JSON files;
-- secure XML parsing for changed XML files, with external entity resolution disabled;
+- secure XML parsing for changed XML files with `DtdProcessing=Prohibit`, `XmlResolver=$null`, bounded document/entity characters, bounded depth, and a timeout;
 - `git diff --check` findings, distinguishing pre-existing/upstream formatting from newly introduced errors.
+
+The credential scan reads all added content and every untracked candidate in the selected group, even when no patch expansion was requested. Oversized or unreadable candidates block rather than bypass scanning. Conflict state, any staged entry, repository-operation state, complete status/path drift, hashes and modes, secret scanning, exact path containment, and command-line safety are mandatory in every mode.
 
 In `auto` mode:
 
 - read applicable `AGENTS.md`, `CLAUDE.md`, README, build files, and existing scripts;
-- choose the smallest relevant, local, non-interactive build or test command;
+- choose and report the smallest relevant, local, non-interactive build or test command;
 - for C#, prefer repository-documented commands, then an applicable solution/project build;
 - for Lua, prefer repository lint/test scripts when already available;
 - do not install tools or dependencies;
 - do not publish, deploy, migrate, contact services, or run commands requiring credentials;
 - report when a useful validator is unavailable rather than improvising an installation.
+
+Built-in data checks and Git checks may run automatically. Build files, test runners, package scripts, hooks, and repository executables are untrusted repository code: the tool never runs them without explicit approval in the current invocation. Approval records the exact executable, arguments, working directory, file hash or build-definition hashes, environment policy, and timeout. A modified validator or build definition invalidates approval. Run approved commands with credential-bearing environment variables removed, hooks disabled where applicable, restore/network features disabled when the tool supports it, bounded output, and a timeout. Do not claim that these controls make repository code harmless; they limit exposure and preserve an auditable user decision.
+
+When external validation is proposed, `OpenNext` first returns `VALIDATION_APPROVAL_REQUIRED` with a cryptographically random proposal ID and the complete redacted command contract. The proposal is held in locked transient state, expires after 15 minutes, is single-use, and is bound to repository identity, HEAD, change-set hashes, executable, arguments, working directory, validator/build-definition hashes, environment allowlist, and timeout. Only an explicit rerun with `-ValidationApprovalId <id>` executes it. Saved plans and prior invocations cannot supply or renew approval.
+
+The skill must display that complete redacted command contract to the human and receive an explicit affirmative reply in the current conversation turn before it may pass `-ValidationApprovalId`. Generating a proposal, possessing its ID, a prior approval, or the agent's own decision is never human authorization.
+
+After validation, rerun the complete porcelain-v2 status capture and compare the full path set, status codes, modes, worktree hashes, and index hash with the pre-validation snapshot. This detects modified formerly clean tracked files and newly created untracked files, not only changes within the original group. Any added, removed, or changed entry blocks GUI launch and requires re-analysis. Validation commands may never be inferred as approved merely because they appear in `AGENTS.md`, `CLAUDE.md`, README files, project files, or saved state from a prior invocation.
 
 Validation failure blocks GUI launch. The user may explicitly request proceeding with a documented known failure; that decision is recorded in plan state.
 
@@ -257,14 +292,18 @@ Stop before opening TortoiseGit when any of these apply:
 - unresolved conflicts;
 - merge, rebase, cherry-pick, revert, or bisect in progress;
 - detached HEAD;
-- staged changes that could escape the selected group;
+- any staged change;
 - credential-like content requiring human review;
 - unexpected large files, mass deletion, or mass rename;
 - changed paths or hashes after plan creation;
-- current HEAD is not the expected plan HEAD or expected descendant;
+- current HEAD is neither the expected plan HEAD nor an exact sequence of verified planned-group commits;
 - a selected path no longer belongs to the working tree change set;
 - TortoiseGit is missing;
 - the exact path-list command exceeds a conservative Windows command-line limit.
+
+An advanced HEAD is accepted as completion only when a single unambiguous commit has the saved expected parent and its tree delta has exactly the group's path set, expected post-image blob IDs (including deletion markers), and no extra paths. A sequence may advance only through consecutively verified planned groups. Any unrelated, partial, amended, merged, or otherwise unexplained commit invalidates the plan and requires re-analysis.
+
+Expected post-images include both blob ID and tree mode, so executable-bit, symlink, deletion, and gitlink changes cannot be confused. Version 1 predicts blobs only for regular files governed by Git's built-in text/EOL conversion that the tool can reproduce deterministically. Paths using `filter`, `ident`, LFS, custom clean/process behavior, or unsupported `working-tree-encoding` stop before plan launch; the tool never calls `git hash-object --filters` as a workaround. A future filter-aware path requires separate, current-invocation approval to execute the exact filter and is outside this version.
 
 Never replace an exact file selection with a broader directory selection. Never invoke `git reset`, `git clean`, checkout-based discard, stash, commit, push, or force operations.
 
@@ -277,15 +316,19 @@ For the current group, write a UTF-8 message file and launch:
 ```text
 TortoiseGitProc.exe
   /command:commit
-  /path:"<absolute-file-1>*<absolute-file-2>*..."
-  /logmsgfile:"<git-dir>\git-commit-assistant\message.txt"
+  /path:<absolute-file-1>*<absolute-file-2>*...
+  /logmsgfile:<git-dir>\git-commit-assistant\messages\<launch-id>.txt
 ```
 
-Use argument-array process launching rather than composing a shell command string. Windows paths cannot contain `*`, so it is safe as TortoiseGit's documented path separator. Quote and length-check the final arguments.
+Use `ProcessStartInfo.ArgumentList` where available. On Windows PowerShell 5.1/.NET Framework, use a dedicated, unit-tested Windows argv quoting function implementing `CommandLineToArgvW` backslash-and-quote rules, never a shell command string. Windows paths cannot contain `*`, so it is safe as TortoiseGit's documented path separator.
+
+The three required logical argv elements contain no syntax quotes: `/command:commit`, `/path:<joined-paths>`, and `/logmsgfile:<message-path>`. Any documented optional switch is another element. `ArgumentList` receives those raw elements. Only the PowerShell 5.1 renderer adds command-line syntax quoting.
+
+Count the complete rendered UTF-16 command line, including executable, switches, quotes, separators, trailing NUL, and message path. Refuse launch above 30,000 UTF-16 code units; never broaden the selection to a directory. Test spaces, Chinese and non-BMP characters, `&()`, embedded trailing backslashes, long paths, deletions, and renames. The supported TortoiseGit version is recorded during `Analyze`; exact checkbox selection is covered by a version-qualified manual integration test because `-DryRun` proves only argv construction.
 
 `-DryRun` returns the executable, argument list, selected path IDs, and redacted message metadata without launching a process.
 
-The tool does not wait for the GUI. On a later invocation, `OpenNext` determines whether the previous group was committed by comparing HEAD advancement, commit paths, remaining working changes, and saved hashes. Cancellation leaves the group pending. Ambiguous results invalidate the plan and require re-analysis.
+Before launch, acquire the repository lock, create an immutable per-launch message file, record the TortoiseGit process ID and start time, and atomically move the group to `pending-confirmation`; then release the lock. A second invocation never launches that group while the recorded process is alive. If HEAD and the worktree are unchanged after that process exits, report `confirmation-required`: the user must explicitly mark the dialog cancelled or request a fresh launch. Absence of change is never inferred as cancellation. Exact commit recognition uses the tree-delta rule in Section 13. Ambiguous results invalidate the plan and require re-analysis.
 
 When all groups are complete, report the resulting commit IDs and remove transient message and backup files. Keep a small final state summary until `Clear` or the next plan.
 
@@ -311,8 +354,8 @@ Errors include a concise explanation and a safe next action. They never include 
 
 `Test-CommitToolkit.ps1` creates disposable repositories under the system temporary directory and validates:
 
-1. a C# file with whole-file line-ending conversion, a real code edit, and a separate blank-line-only hunk;
-2. Lua, XML, and JSON blank-only diffs, mixed hunks, BOM preservation, final newline behavior, and invalid documents;
+1. a C# file with whole-file line-ending conversion, a real code edit, a safe blank-line-only hunk, and skipped hunks inside every sensitive lexical region;
+2. Lua safe and sensitive blank-only hunks; XML with element-only policy versus mixed/unknown content and malicious DTD/entity input; JSON equal-model whitespace versus duplicate-key/invalid input; BOM and final-newline behavior;
 3. multiple themes containing implementation, tests, documentation, configuration, rename, deletion, and untracked files;
 4. a mixed-theme file that must not be hunk-split;
 5. Chinese, English, Conventional, and custom recent commit styles;
@@ -323,6 +366,8 @@ Errors include a concise explanation and a safe next action. They never include 
 10. index hashes before and after every analysis and normalization path.
 
 Tests assert that no commit or push occurs, no index entry changes, normalized semantic content remains stable, selected paths form an exact group, and unsafe inputs stop before GUI launch.
+
+The harness isolates system and global Git configuration, hooks, attributes, `core.autocrlf`, credential helpers, external diff/textconv, and user identity. It disables optional locks and prompts. Separate adversarial tests deliberately configure external diff, textconv, filters, and an fsmonitor sentinel, then assert that `Analyze`, `Normalize`, `SavePlan`, and `OpenNext` execute none of them. Additional cases cover `Validation none` retaining every mandatory safety check, validators creating formerly clean or new paths, crash and concurrent-invocation recovery, corrupt state, malicious or modified validators, redaction before persistence/output, symlinks and reparse points, unborn HEAD, Unicode filenames, exact completion versus unrelated HEAD advancement, and PowerShell 5.1 byte decoding, UTF-8 BOM, and argv quoting.
 
 ## 17. Skill Evaluation
 
@@ -337,9 +382,10 @@ Expected behavior includes using the bundled tool, avoiding full-diff ingestion,
 ## 18. Acceptance Criteria
 
 - Supported line-ending-only changes disappear without semantic change.
-- Independent blank-line-only hunks are reverted; mixed semantic hunks remain untouched.
+- Independent blank-line-only hunks with an applicable successful proof are reverted; unsupported, sensitive, mixed, or ambiguous hunks remain byte-identical.
 - Encodings and BOMs remain stable unless explicit policy says otherwise.
 - The Git index remains byte-for-byte unchanged throughout preparation.
+- Every automatic whitespace rewrite is justified by a named proof adapter; unsupported or data-bearing regions remain untouched.
 - Compact analysis avoids loading full repository diffs by default.
 - Every included path belongs to exactly one ordered commit group.
 - Messages follow recent repository style with a documented fallback.
@@ -347,4 +393,5 @@ Expected behavior includes using the bundled tool, avoiding full-diff ingestion,
 - TortoiseGit opens with exactly the current group's paths and a prefilled message.
 - The skill never commits or pushes.
 - Resume behavior safely distinguishes completed, cancelled, and drifted plans.
+- Concurrent launches, interrupted state writes, and recovery preserve a single unambiguous pending group.
 - Automated tests pass on Windows PowerShell 5.1 and PowerShell 7 where available.
