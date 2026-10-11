@@ -1,0 +1,41 @@
+{
+  "skill_name": "git-commit-assistant",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "帮我整理这个 Unity 项目的 C#、Lua、XML 改动，拆分后用 TortoiseGit 提交。",
+      "expected_output": "Uses the deterministic toolkit, preserves the index, normalizes only proven-safe noise, proposes file-level groups, and opens only one exact TortoiseGit group after safety checks.",
+      "files": [],
+      "expectations": [
+        "Runs the bundled CommitToolkit.ps1 instead of loading the complete repository diff into model context.",
+        "Preserves the Git index and does not run git commit or git push.",
+        "Creates defensible file-level commit groups without splitting a file by hunk.",
+        "Uses recent repository history to propose messages and hands off only one group through an exact TortoiseGit dry-run."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "这些改动里有大量换行噪音，只保留有效 diff，按仓库风格准备提交。",
+      "expected_output": "Runs compact analysis and conservative normalization, reports skipped ambiguous content, learns recent message style, and never commits or pushes.",
+      "files": [],
+      "expectations": [
+        "Runs Analyze and Normalize and reports named proof adapters plus skipped ambiguous content.",
+        "Keeps semantic edits and does not normalize sensitive literal or Markdown regions without proof.",
+        "Uses compact metadata rather than emitting a full diff.",
+        "Does not commit, push, stage, or alter the index."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "继续上次未完成的提交计划，打开下一组 TortoiseGit 窗口。",
+      "expected_output": "Loads Git-directory state, verifies the prior exact commit or requests cancellation confirmation, checks drift, and opens at most one next group.",
+      "files": [],
+      "expectations": [
+        "Runs Status before attempting a fresh analysis or launch.",
+        "Recognizes pending-confirmation state and does not infer cancellation from unchanged HEAD.",
+        "Does not launch another TortoiseGit window without explicit cancellation confirmation.",
+        "Reports the exact safe next action without committing or pushing."
+      ]
+    }
+  ]
+}

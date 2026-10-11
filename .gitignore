@@ -28,6 +28,7 @@
 # Runtime state
 /.tmp/
 /.token-meter-data/
+/skills/*-workspace/
 *.log
 *.log.*
 *.pid
