@@ -33,8 +33,8 @@ Use these batch operations:
 
 1. one porcelain-v2, NUL-delimited status capture;
 2. one NUL-delimited `check-attr --stdin` request for every changed path;
-3. one NUL-delimited `diff <captured-head-oid> --numstat --no-renames` request for tracked changes when `HEAD` exists and the attribute gate is safe;
-4. one NUL-delimited `diff <captured-head-oid> --name-only --ignore-all-space --no-renames` request to preserve the Boolean `whitespaceOnly` contract when the attribute gate is safe;
+3. one NUL-delimited `diff <captured-head-oid> --numstat --no-renames` request for tracked changes when `HEAD` exists and the content-safety gate is clear;
+4. one NUL-delimited `diff <captured-head-oid> --name-only --ignore-all-space --no-renames` request to preserve the Boolean `whitespaceOnly` contract when the content-safety gate is clear;
 5. one recent-subject log request;
 6. the existing fixed repository-state and operation checks.
 
@@ -46,7 +46,7 @@ Parse batch output defensively. Attribute records must map exactly to requested 
 
 When `HEAD` is unborn, skip both bulk diff commands and return nullable line/hunk statistics plus `whitespaceOnly: false`; later actions retain the existing `UNBORN_HEAD` stop. Compare against the captured HEAD OID, rather than the index, so staged and unstaged endpoint changes share one deterministic basis. Classify staged/conflicted state from porcelain before consuming optional statistics.
 
-Run the bulk attribute request before either diff. If any changed path has `filter` or `ident` enabled, or has an unsupported `working-tree-encoding`, skip both optional bulk diff commands for the entire snapshot and report the affected path/rule without values. Every file in that snapshot then receives `added: null`, `deleted: null`, `hunks: null`, `whitespaceOnly: false`, and `diffDetailsDeferred: true`; the gate applies to the snapshot, not only the unsafe path. This conservative whole-snapshot gate prevents Git from starting clean/process filters and avoids unsafe long path lists. Mandatory later safety checks still reject selecting such paths. Add a mixed safe-plus-filtered fixture and a process-sentinel assertion proving that no configured filter starts during `Analyze`.
+Run component/reparse classification and the bulk attribute request before either diff. If any changed path is reparse-blocked, has `filter` or `ident` enabled, or has an unsupported `working-tree-encoding`, skip both optional bulk diff commands for the entire snapshot and report the affected path/rule without values. Every file in that snapshot then receives `added: null`, `deleted: null`, `hunks: null`, `whitespaceOnly: false`, and `diffDetailsDeferred: true`; the content-safety gate applies to the snapshot, not only the unsafe path. This conservative whole-snapshot gate prevents Git from opening reparse targets or starting clean/process filters and avoids unsafe long path lists. Mandatory later safety checks still reject selecting such paths. Add mixed safe-plus-filtered and safe-plus-reparse fixtures plus process sentinels proving that neither a configured filter nor a reparse target is opened during `Analyze`.
 
 Use the captured immutable HEAD OID in both diff commands, never symbolic `HEAD`. Immediately before returning or persisting context, re-read HEAD and branch and compare them with the captured values. Any concurrent commit, reset, checkout, or branch change returns `WORKTREE_DRIFT`; the index-byte check remains mandatory.
 
