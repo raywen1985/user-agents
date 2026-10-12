@@ -33,18 +33,22 @@ Use these batch operations:
 
 1. one porcelain-v2, NUL-delimited status capture;
 2. one NUL-delimited `check-attr --stdin` request for every changed path;
-3. one NUL-delimited `diff HEAD --numstat --no-renames` request for tracked changes when `HEAD` exists;
-4. one NUL-delimited `diff HEAD --name-only --ignore-all-space --no-renames` request to preserve the Boolean `whitespaceOnly` contract;
+3. one NUL-delimited `diff <captured-head-oid> --numstat --no-renames` request for tracked changes when `HEAD` exists and the attribute gate is safe;
+4. one NUL-delimited `diff <captured-head-oid> --name-only --ignore-all-space --no-renames` request to preserve the Boolean `whitespaceOnly` contract when the attribute gate is safe;
 5. one recent-subject log request;
 6. the existing fixed repository-state and operation checks.
 
-Read file size, type, hash, and eligible untracked secret content locally. Do not request a patch during default analysis.
+Classify a path as a reparse point before reading its size, bytes, hash, or eligible untracked secret content. Reparse entries retain path/status metadata but receive no content-derived metadata, and analysis never opens their targets. For ordinary files, read size, type, hash, and eligible untracked secret content locally. Do not request a patch during default analysis.
 
-The existing `hunks` field remains nullable and returns `null` in fast analysis, consistent with its existing behavior for untracked, deleted, oversized, or unavailable patches. `whitespaceOnly` remains Boolean: it is `false` for untracked, deleted, renamed, copied, binary, or unborn-HEAD entries; otherwise it is derived from membership in the one bulk `--ignore-all-space` name set. Add `diffDetailsDeferred: true` and an analysis summary containing `mode: fast`, elapsed milliseconds, and Git subprocess count.
+The existing `hunks` field remains nullable and returns `null` in fast analysis, consistent with its existing behavior for untracked, deleted, oversized, or unavailable patches. `whitespaceOnly` remains Boolean: it is `false` for untracked, deleted, renamed, copied, binary, unborn-HEAD, or attribute-gated entries. For another tracked changed path, it is `true` only when that path is absent from the bulk `--ignore-all-space` name set, meaning no substantive difference remains after whitespace is ignored; membership means `false`. Add `diffDetailsDeferred: true` and an analysis summary containing `mode: fast`, elapsed milliseconds, and Git subprocess count.
 
 Parse batch output defensively. Attribute records must map exactly to requested canonical paths. The status command pins rename-only detection with `--find-renames=50%` and disables copy detection regardless of repository configuration. Both bulk diff commands use `--no-renames`. Rename status entries keep `originalPath` from porcelain and receive `added`, `deleted`, `hunks` as `null` and `whitespaceOnly` as `false`; their recognized old/new decomposition records are not assigned to another file. Ordinary numstat records map by exact canonical path. Binary counts remain `null`. Missing statistics are allowed for staged/conflicted paths so the preserved safety gate can return `INDEX_NOT_CLEAN` or `CONFLICTS_PRESENT` before statistics matter. Unexpected, duplicate, truncated, invalid-numeric, or otherwise malformed records stop with `BATCH_PARSE_FAILED`.
 
-When `HEAD` is unborn, skip both bulk diff commands and return nullable line/hunk statistics plus `whitespaceOnly: false`; later actions retain the existing `UNBORN_HEAD` stop. Compare against `HEAD`, rather than the index, so staged and unstaged endpoint changes share one deterministic basis. Classify staged/conflicted state from porcelain before consuming optional statistics.
+When `HEAD` is unborn, skip both bulk diff commands and return nullable line/hunk statistics plus `whitespaceOnly: false`; later actions retain the existing `UNBORN_HEAD` stop. Compare against the captured HEAD OID, rather than the index, so staged and unstaged endpoint changes share one deterministic basis. Classify staged/conflicted state from porcelain before consuming optional statistics.
+
+Run the bulk attribute request before either diff. If any changed path has `filter` or `ident` enabled, or has an unsupported `working-tree-encoding`, skip both optional bulk diff commands for the entire snapshot and report the affected path/rule without values. This conservative whole-snapshot gate prevents Git from starting clean/process filters and avoids unsafe long path lists. Mandatory later safety checks still reject selecting such paths. Add a process-sentinel test proving that no configured filter starts during `Analyze`.
+
+Use the captured immutable HEAD OID in both diff commands, never symbolic `HEAD`. Immediately before returning or persisting context, re-read HEAD and branch and compare them with the captured values. Any concurrent commit, reset, checkout, or branch change returns `WORKTREE_DRIFT`; the index-byte check remains mandatory.
 
 ## 4. Deferred Detail
 
@@ -68,6 +72,8 @@ Count Git subprocesses in `Invoke-Git` rather than estimating them. Start the co
 - Preserve action names, plan schema version 1, existing file-record fields, and the Boolean type of `whitespaceOnly`.
 - Preserve byte-level index hashing before and after actions.
 - Preserve staged-change, conflict, active-operation, detached-HEAD, filter, encoding, secret, drift, and path safety stops.
+- Inspect reparse metadata before every local content access and never follow a reparse target during analysis.
+- Run no diff command capable of worktree conversion until the attribute gate proves the complete changed path set free of custom filters, `ident`, and unsupported encodings.
 - Keep `Normalize` available with the same conservative proof adapters and transactional recovery.
 - Do not cache repository state across invocations; every action captures current status and hashes.
 - If a batch command or parser fails, stop with `BATCH_PARSE_FAILED` rather than falling back to the old per-file slow loop.
@@ -89,10 +95,15 @@ Extend the disposable PowerShell test suite with:
 3. ordinary, deletion, binary, and rename numstat parser coverage, including spaces and Unicode in paths;
 4. negative parser fixtures for duplicate, missing attribute, unexpected, truncated, and invalid-numeric records, all returning `BATCH_PARSE_FAILED`;
 5. bulk attribute mapping coverage;
-6. compatibility assertions that `hunks` remains present and nullable while `whitespaceOnly` remains Boolean;
-7. index-byte preservation and fsmonitor suppression under the bulk path;
-8. `Normalize` refusal while a saved plan exists;
-9. PowerShell 5.1 and PowerShell 7 runs.
+6. porcelain-v2 rejection fixtures for unknown kinds, duplicate paths, empty paths, truncated rename records, and empty rename sources;
+7. semantic fixtures proving whitespace-only edits map to `true` and substantive edits map to `false`;
+8. compatibility assertions that `hunks` remains present and nullable while `whitespaceOnly` remains Boolean;
+9. index-byte preservation and fsmonitor suppression under the bulk path;
+10. filter-process sentinel coverage before bulk diff;
+11. a locked external reparse target proving analysis classifies the entry without opening its target;
+12. captured-HEAD drift detection;
+13. `Normalize` refusal while a saved plan exists;
+14. PowerShell 5.1 and PowerShell 7 runs.
 
 Keep batch parsers as byte-array-to-object functions that can be loaded by the test harness without executing a toolkit action; the implementation may use a test-only load switch or a small parsing module. Use subprocess count as the hard performance regression assertion because wall-clock thresholds are unreliable across machines. Record before/after elapsed time on the same synthetic repository as informative evidence.
 
