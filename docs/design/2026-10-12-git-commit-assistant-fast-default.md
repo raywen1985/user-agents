@@ -23,6 +23,8 @@ The preparation report states one of:
 
 Resuming a saved plan never introduces normalization that was not performed before `SavePlan`.
 
+`Normalize` must refuse to run whenever `plan.json` or `state.json` exists. The user must finish or explicitly `Clear` the saved plan before starting a new cleanup pass. This makes the pre-plan normalization boundary enforceable without changing plan schema version 1. Normalization mode is reported for the current preparation invocation; it is not reconstructed as historical metadata during resume.
+
 ## 3. Fast Analysis
 
 `Analyze` becomes a fast manifest operation. Its Git subprocess count must remain approximately constant as the changed-file count grows.
@@ -31,25 +33,27 @@ Use these batch operations:
 
 1. one porcelain-v2, NUL-delimited status capture;
 2. one NUL-delimited `check-attr --stdin` request for every changed path;
-3. one NUL-delimited `diff --numstat` request for tracked changes;
-4. one recent-subject log request;
-5. the existing fixed repository-state and operation checks.
+3. one NUL-delimited `diff HEAD --numstat --no-renames` request for tracked changes when `HEAD` exists;
+4. one NUL-delimited `diff HEAD --name-only --ignore-all-space --no-renames` request to preserve the Boolean `whitespaceOnly` contract;
+5. one recent-subject log request;
+6. the existing fixed repository-state and operation checks.
 
 Read file size, type, hash, and eligible untracked secret content locally. Do not request a patch during default analysis.
 
-The existing `hunks` and `whitespaceOnly` fields remain in the file records for schema compatibility, but fast analysis returns `null`. Add `diffDetailsDeferred: true` and an analysis summary containing `mode: fast`, elapsed milliseconds, and Git subprocess count.
+The existing `hunks` field remains nullable and returns `null` in fast analysis, consistent with its existing behavior for untracked, deleted, oversized, or unavailable patches. `whitespaceOnly` remains Boolean: it is `false` for untracked, deleted, renamed, copied, binary, or unborn-HEAD entries; otherwise it is derived from membership in the one bulk `--ignore-all-space` name set. Add `diffDetailsDeferred: true` and an analysis summary containing `mode: fast`, elapsed milliseconds, and Git subprocess count.
 
-Parse batch output defensively. Attribute records must map exactly to requested canonical paths. Numstat parsing must cover ordinary, deleted, and renamed paths and must reject malformed records instead of silently assigning statistics to the wrong file.
+Parse batch output defensively. Attribute records must map exactly to requested canonical paths. The status command pins rename-only detection with `--find-renames=50%` and disables copy detection regardless of repository configuration. Both bulk diff commands use `--no-renames`. Rename status entries keep `originalPath` from porcelain and receive `added`, `deleted`, `hunks` as `null` and `whitespaceOnly` as `false`; their recognized old/new decomposition records are not assigned to another file. Ordinary numstat records map by exact canonical path. Binary counts remain `null`. Missing statistics are allowed for staged/conflicted paths so the preserved safety gate can return `INDEX_NOT_CLEAN` or `CONFLICTS_PRESENT` before statistics matter. Unexpected, duplicate, truncated, invalid-numeric, or otherwise malformed records stop with `BATCH_PARSE_FAILED`.
+
+When `HEAD` is unborn, skip both bulk diff commands and return nullable line/hunk statistics plus `whitespaceOnly: false`; later actions retain the existing `UNBORN_HEAD` stop. Compare against `HEAD`, rather than the index, so staged and unstaged endpoint changes share one deterministic basis. Classify staged/conflicted state from porcelain before consuming optional statistics.
 
 ## 4. Deferred Detail
 
-Detailed patch work occurs only when it can change a decision:
+Detailed work occurs only when it can change a decision:
 
-- an ambiguous file-level group may be expanded with a narrowly scoped `git diff --unified=1 -- <exact paths>` after secret scanning;
 - an explicit cleanup request runs `Normalize`, whose proof adapters may inspect zero-context hunks for eligible files;
 - mandatory validation continues to inspect the selected group as required.
 
-Do not add a repository-wide deep-analysis mode. This avoids recreating the slow path under another default and keeps token usage bounded.
+Do not emit or persist patch text in this version. There is no toolkit-owned redaction channel that can prove a tracked patch safe before returning it, so an ambiguous group is reported as mixed and the user is asked to reorganize or identify its intent. Do not add a repository-wide deep-analysis mode. This avoids recreating the slow path under another default, prevents pre-validation secret disclosure, and keeps token usage bounded.
 
 ## 5. Internal Refactor
 
@@ -57,16 +61,16 @@ Replace per-file `Get-PathAttributes` calls with a bulk attribute map. Replace p
 
 `Get-Context` remains the shared snapshot producer for `Analyze`, `Normalize`, `SavePlan`, and `OpenNext`. All callers receive the same status, hashes, attributes, and safety flags. Only explicit normalization performs per-file proof work.
 
-Count Git subprocesses in the invocation wrapper rather than estimating them. Measure elapsed time with a monotonic stopwatch. Diagnostics contain counts and durations only, never command output, file contents, environment values, or secret matches.
+Count Git subprocesses in `Invoke-Git` rather than estimating them. Start the counter and monotonic stopwatch before `Resolve-Repository`, so diagnostics cover the complete toolkit invocation. For `Analyze`, return `summary.performance.mode`, `summary.performance.elapsedMilliseconds`, and `summary.performance.gitProcessCount`. Diagnostics contain counts and durations only, never command output, file contents, environment values, or secret matches.
 
 ## 6. Compatibility and Safety
 
-- Preserve action names, plan schema version 1, and existing file-record fields.
+- Preserve action names, plan schema version 1, existing file-record fields, and the Boolean type of `whitespaceOnly`.
 - Preserve byte-level index hashing before and after actions.
 - Preserve staged-change, conflict, active-operation, detached-HEAD, filter, encoding, secret, drift, and path safety stops.
 - Keep `Normalize` available with the same conservative proof adapters and transactional recovery.
 - Do not cache repository state across invocations; every action captures current status and hashes.
-- If a batch command or parser fails, stop with a stable error rather than falling back to the old per-file slow loop.
+- If a batch command or parser fails, stop with `BATCH_PARSE_FAILED` rather than falling back to the old per-file slow loop.
 
 ## 7. Skill and Evaluation Changes
 
@@ -80,14 +84,17 @@ Keep the existing noise-cleanup evaluation; it must still invoke `Normalize` bec
 
 Extend the disposable PowerShell test suite with:
 
-1. a large changed-file fixture proving that `Analyze` returns all paths while Git subprocess count stays under a fixed ceiling independent of file count;
-2. ordinary, deletion, and rename numstat parser coverage, including spaces and Unicode in paths;
-3. bulk attribute mapping coverage;
-4. compatibility assertions that `hunks` and `whitespaceOnly` remain present and are `null` in fast mode;
-5. index-byte preservation and fsmonitor suppression under the bulk path;
-6. PowerShell 5.1 and PowerShell 7 runs.
+1. a large changed-file fixture proving that the saved `context.json` contains all paths while the bounded stdout summary retains its existing 250-file limit;
+2. whole-invocation `gitProcessCount <= 20` for both one-file and 100-file tracked-change fixtures, with the two counts differing by at most one;
+3. ordinary, deletion, binary, and rename numstat parser coverage, including spaces and Unicode in paths;
+4. negative parser fixtures for duplicate, missing attribute, unexpected, truncated, and invalid-numeric records, all returning `BATCH_PARSE_FAILED`;
+5. bulk attribute mapping coverage;
+6. compatibility assertions that `hunks` remains present and nullable while `whitespaceOnly` remains Boolean;
+7. index-byte preservation and fsmonitor suppression under the bulk path;
+8. `Normalize` refusal while a saved plan exists;
+9. PowerShell 5.1 and PowerShell 7 runs.
 
-Use subprocess count as the hard performance regression assertion because wall-clock thresholds are unreliable across machines. Record before/after elapsed time on the same synthetic repository as informative evidence.
+Keep batch parsers as byte-array-to-object functions that can be loaded by the test harness without executing a toolkit action; the implementation may use a test-only load switch or a small parsing module. Use subprocess count as the hard performance regression assertion because wall-clock thresholds are unreliable across machines. Record before/after elapsed time on the same synthetic repository as informative evidence.
 
 ## 9. Acceptance Criteria
 
