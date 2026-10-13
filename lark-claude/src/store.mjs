@@ -149,6 +149,29 @@ export class Store {
     return this.db.prepare("SELECT * FROM tasks WHERE id=?").get(id) || null;
   }
 
+  enrichActivitySnapshot(snapshot) {
+    if (!Array.isArray(snapshot) || snapshot.length > 201) throw new Error("Scheduler activity snapshot is invalid");
+    return snapshot.flatMap((entry) => {
+      const session = this.getSession(entry.sessionId);
+      const task = this.getTask(entry.taskId);
+      if (!session || !task || task.session_id !== session.id) return [];
+      return [{
+        provider: "gateway",
+        agent: session.executor,
+        sessionId: session.id,
+        gatewayId: session.id,
+        nativeId: session.native_id,
+        name: session.name,
+        status: entry.phase,
+        cwd: session.project_path,
+        projectAlias: session.project_alias,
+        pid: null,
+        updatedAt: task.updated_at,
+        taskId: task.id,
+      }];
+    });
+  }
+
   latestTaskForSession(sessionId) {
     return this.db.prepare("SELECT * FROM tasks WHERE session_id=? ORDER BY updated_at DESC LIMIT 1").get(sessionId) || null;
   }

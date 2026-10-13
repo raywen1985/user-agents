@@ -56,5 +56,10 @@ npm run status
 - `列出最近的 Session`
 - `取消资源泄漏那个 Session`
 - `批准 RQ-260930-ABC123`
+- `查询当前 PC 上所有正在工作的 Agent Session`
 
 所有任务消息都会包含 `执行器 | 项目 | Session Name | Session ID`。同一项目严格串行，不同项目最多并发两个。Codex 的项目内普通新增/修改可自动批准；删除、越界写和未知命令需要在飞书二次确认。
+
+与项目无关的本机操作仅允许调用网关源代码中登记的内部技能。目前只登记了
+“查询正在工作的 Agent Session”，它会只读汇总 Codex、Claude Code 与网关
+队列；其他自由形式的本机命令不会执行。

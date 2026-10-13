@@ -1,12 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import { createCodexExecutableResolver } from "./codex-executable.mjs";
+import { listActiveAgentSessions } from "./active-agent-sessions.mjs";
 import { loadConfig, projectRoot } from "./config.mjs";
 import { ClaudeExecutor } from "./executors/claude.mjs";
 import { CodexExecutor } from "./executors/codex.mjs";
 import { formatSessionLine, formatSessionMessage } from "./format.mjs";
 import { LarkListener, LarkMessenger } from "./lark.mjs";
 import { logger } from "./logger.mjs";
+import { createInternalSkillRegistry } from "./internal-skills.mjs";
 import { buildRouterContext, resolveIntent } from "./resolver.mjs";
 import { ClaudeRouter } from "./router.mjs";
 import { Scheduler } from "./scheduler.mjs";
@@ -89,6 +91,13 @@ const scheduler = new Scheduler({
   onMessage: sendSession,
 });
 
+const internalSkills = createInternalSkillRegistry({
+  list_active_agent_sessions: async ({ gatewayActivities, gatewayTruncated }) => listActiveAgentSessions({
+    gatewayActivities,
+    gatewayTruncated,
+  }),
+});
+
 function updateHealth(extra = {}) {
   fs.writeFileSync(healthPath, JSON.stringify({
     pid: process.pid,
@@ -101,7 +110,15 @@ function updateHealth(extra = {}) {
 async function handleResolved(resolved, message) {
   if (resolved.type === "reply") return sendGlobal(resolved.text, `reply-${message.message_id}`);
   if (resolved.type === "help" || resolved.type === "unknown") {
-    return sendGlobal("可以自然语言要求 Codex 或 Claude 在已登记项目中新建任务，也可以继续、查看、取消现有 Session，或批准/拒绝待确认请求。", `help-${message.message_id}`);
+    return sendGlobal("可以自然语言要求 Codex 或 Claude 在已登记项目中新建任务，也可以继续、查看、取消现有 Session，批准/拒绝待确认请求，或查询当前 PC 正在工作的 Agent Session。", `help-${message.message_id}`);
+  }
+  if (resolved.type === "internal_skill") {
+    const snapshot = scheduler.activitySnapshot(201);
+    const gatewayTruncated = snapshot.length > 200;
+    const gatewayActivities = Object.freeze(store.enrichActivitySnapshot(snapshot.slice(0, 200))
+      .map((record) => Object.freeze(record)));
+    const text = await internalSkills.dispatch(resolved.skillName, Object.freeze({ gatewayActivities, gatewayTruncated }));
+    return sendGlobal(text, `internal-${resolved.skillName}-${message.message_id}`);
   }
   if (resolved.type === "list") {
     const sessions = store.listSessions(gateway.recentSessionLimit);
@@ -152,9 +169,9 @@ async function handleEvent(message) {
   }
   if (!message.message_id || !message.content || !store.acceptInbox(message)) return;
   try {
-    const context = buildRouterContext(config, store, message);
+    const context = buildRouterContext(config, store, message, internalSkills);
     const intent = await router.route(message, context);
-    const resolved = resolveIntent(intent, config, store, message);
+    const resolved = resolveIntent(intent, config, store, message, internalSkills);
     await handleResolved(resolved, message);
     store.markInbox(message.message_id, "processed");
   } catch (error) {

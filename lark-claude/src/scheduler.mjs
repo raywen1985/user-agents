@@ -43,6 +43,35 @@ export class Scheduler {
     return true;
   }
 
+  activitySnapshot(limit = 201) {
+    const waiting = new Set([...this.approvalWaiters.values()]
+      .map((entry) => `${entry.sessionId}\u0000${entry.taskId}`));
+    const rows = [];
+    for (const [sessionId, entry] of this.active) {
+      const taskId = entry.task.id;
+      rows.push({
+        sessionId,
+        taskId,
+        phase: waiting.has(`${sessionId}\u0000${taskId}`) ? "waiting_approval" : "running",
+        taskUpdatedAt: entry.task.updated_at || entry.task.created_at || 0,
+        queuePosition: null,
+      });
+    }
+    this.queue.forEach(({ task, session }, queuePosition) => rows.push({
+      sessionId: session.id,
+      taskId: task.id,
+      phase: "queued",
+      taskUpdatedAt: task.updated_at || task.created_at || 0,
+      queuePosition,
+    }));
+    const priority = { waiting_approval: 0, running: 1, queued: 2 };
+    rows.sort((left, right) => priority[left.phase] - priority[right.phase]
+      || right.taskUpdatedAt - left.taskUpdatedAt
+      || left.sessionId.localeCompare(right.sessionId)
+      || left.taskId.localeCompare(right.taskId));
+    return Object.freeze(rows.slice(0, limit).map((row) => Object.freeze(row)));
+  }
+
   #drain() {
     while (this.runningProjects.size < this.maxConcurrentProjects) {
       const index = this.queue.findIndex((entry) => !this.runningProjects.has(entry.session.project_path.toLowerCase()));
@@ -69,6 +98,8 @@ export class Scheduler {
       }, 600000);
       timer.unref?.();
       this.approvalWaiters.set(approval.id, {
+        sessionId: session.id,
+        taskId: task.id,
         resolve: (decision) => {
           clearTimeout(timer);
           resolve(decision);
@@ -79,7 +110,7 @@ export class Scheduler {
 
   async #run({ task, session }) {
     const abort = new AbortController();
-    this.active.set(session.id, { abort, taskId: task.id });
+    this.active.set(session.id, { abort, task });
     this.store.updateTask(task.id, "running");
     this.store.updateSession(session.id, { status: "running" });
     await this.onMessage(session, "已开始处理。", `start-${task.id}`);

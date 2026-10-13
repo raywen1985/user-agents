@@ -6,7 +6,7 @@ function unique(rows, description) {
   return { question: `没有找到${description}，请回复 Session Name 或 ID。` };
 }
 
-export function buildRouterContext(config, store, message) {
+export function buildRouterContext(config, store, message, internalSkills = null) {
   store.expireApprovals();
   const sessions = store.listSessions(config.gateway.recentSessionLimit).map((row) => ({
     id: row.id,
@@ -22,6 +22,7 @@ export function buildRouterContext(config, store, message) {
     recent_sessions: sessions,
     replied_session: replySession ? { id: replySession.id, name: replySession.name } : null,
     pending_approvals: store.listPendingApprovals().map((row) => ({ id: row.id, session_id: row.session_id, description: row.description })),
+    internal_skills: internalSkills?.descriptors?.() || [],
   };
 }
 
@@ -34,12 +35,21 @@ function resolveSession(intent, config, store, message) {
   return unique(candidates.slice(0, 1), "可继续的 Session");
 }
 
-export function resolveIntent(intent, config, store, message) {
+export function resolveIntent(intent, config, store, message, internalSkills = null) {
   if (intent.needs_clarification || intent.action === "clarify") {
     return { type: "reply", text: intent.clarification || "请补充执行器、项目或 Session。" };
   }
   if (["help", "unknown"].includes(intent.action)) return { type: intent.action };
   if (intent.action === "list") return { type: "list" };
+
+  if (intent.action === "internal_skill") {
+    const forbidden = ["executor", "project_alias", "session_ref", "session_name", "request_ref", "content"];
+    if (forbidden.some((field) => intent[field] != null)) {
+      return { type: "reply", text: "请将 Agent Session 查询与项目任务分成两条消息发送。" };
+    }
+    if (!internalSkills?.has?.(intent.skill_name)) return { type: "unknown" };
+    return { type: "internal_skill", skillName: intent.skill_name };
+  }
 
   if (["approve", "reject"].includes(intent.action)) {
     const pending = store.listPendingApprovals();

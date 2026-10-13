@@ -13,6 +13,7 @@
         "approve",
         "reject",
         "help",
+        "internal_skill",
         "clarify",
         "unknown"
       ]
@@ -20,6 +21,10 @@
     "executor": {
       "type": ["string", "null"],
       "enum": ["codex", "claude", null]
+    },
+    "skill_name": {
+      "type": ["string", "null"],
+      "enum": ["list_active_agent_sessions", null]
     },
     "project_alias": {
       "type": ["string", "null"]
@@ -45,6 +50,7 @@
   },
   "required": [
     "action",
+    "skill_name",
     "executor",
     "project_alias",
     "session_ref",

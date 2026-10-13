@@ -8,6 +8,7 @@ export function runProcess(file, args, options = {}) {
     timeoutMs = 0,
     signal,
     windowsHide = true,
+    maxOutputBytes = 0,
   } = options;
 
   return new Promise((resolve, reject) => {
@@ -50,10 +51,22 @@ export function runProcess(file, args, options = {}) {
       finish(error);
     };
 
+    const appendOutput = (current, chunk) => {
+      const next = current + chunk;
+      if (maxOutputBytes > 0 && Buffer.byteLength(next, "utf8") > maxOutputBytes) {
+        terminate();
+        const error = new Error(`Process output exceeded ${maxOutputBytes} bytes`);
+        error.code = "EOUTPUTLIMIT";
+        finish(error);
+        return current;
+      }
+      return next;
+    };
+
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.stdout.on("data", (chunk) => { stdout = appendOutput(stdout, chunk); });
+    child.stderr.on("data", (chunk) => { stderr = appendOutput(stderr, chunk); });
     child.on("error", (error) => finish(error));
     child.on("close", (code, processSignal) => finish(null, { code, signal: processSignal, stdout, stderr, pid: child.pid }));
 

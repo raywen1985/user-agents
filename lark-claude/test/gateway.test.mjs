@@ -5,8 +5,10 @@ import path from "node:path";
 import test from "node:test";
 import { isSafeFileChange, isSafeReadCommand } from "../src/executors/codex.mjs";
 import { formatSessionMessage } from "../src/format.mjs";
+import { createInternalSkillRegistry } from "../src/internal-skills.mjs";
 import { normalizeLarkEvent } from "../src/lark.mjs";
-import { resolveIntent } from "../src/resolver.mjs";
+import { buildRouterContext, resolveIntent } from "../src/resolver.mjs";
+import { Scheduler } from "../src/scheduler.mjs";
 import { Store } from "../src/store.mjs";
 
 function withStore(run) {
@@ -48,6 +50,65 @@ test("resolver creates a new task only for a registered project", () => {
     }, config, store, {});
     assert.equal(result.type, "enqueue");
     assert.equal(result.project.alias, "unity_asset");
+  });
+});
+
+test("resolver dispatches only an argument-free registered internal skill", () => {
+  const config = testConfig();
+  const registry = createInternalSkillRegistry({ list_active_agent_sessions: async () => "ok" });
+  withStore((store) => {
+    const intent = {
+      action: "internal_skill", skill_name: "list_active_agent_sessions",
+      executor: null, project_alias: null, session_ref: null, session_name: null,
+      request_ref: null, content: null, needs_clarification: false, clarification: null,
+    };
+    assert.deepEqual(resolveIntent(intent, config, store, {}, registry), {
+      type: "internal_skill", skillName: "list_active_agent_sessions",
+    });
+    assert.equal(resolveIntent({ ...intent, skill_name: "invented" }, config, store, {}, registry).type, "unknown");
+    assert.equal(resolveIntent({ ...intent, project_alias: "unity" }, config, store, {}, registry).type, "reply");
+    assert.equal(resolveIntent({ ...intent, content: "run powershell" }, config, store, {}, registry).type, "reply");
+    assert.deepEqual(buildRouterContext(config, store, { reply_to: null }, registry).internal_skills, [{
+      name: "list_active_agent_sessions",
+      description: "查询当前 PC 上正在工作的 Codex、Claude Code 和网关 Session",
+    }]);
+  });
+});
+
+test("internal skill registry never dispatches unknown names", async () => {
+  let calls = 0;
+  const registry = createInternalSkillRegistry({
+    list_active_agent_sessions: async () => { calls += 1; return "ok"; },
+  });
+  assert.equal(await registry.dispatch("list_active_agent_sessions", Object.freeze({})), "ok");
+  await assert.rejects(() => registry.dispatch("run_shell", {}), /不可用/);
+  assert.equal(calls, 1);
+});
+
+test("scheduler snapshot uses live queue and approval waiters", () => {
+  const scheduler = new Scheduler({ store: {}, executors: {}, onMessage() {} });
+  const runningTask = { id: "TK-R", created_at: 20, updated_at: 20 };
+  const queuedTask = { id: "TK-Q", created_at: 10, updated_at: 10 };
+  scheduler.active.set("CX-R", { abort: new AbortController(), task: runningTask });
+  scheduler.queue.push({ task: queuedTask, session: { id: "CX-Q" } });
+  scheduler.approvalWaiters.set("RQ-1", { sessionId: "CX-R", taskId: "TK-R", resolve() {} });
+  assert.deepEqual(scheduler.activitySnapshot(), [
+    { sessionId: "CX-R", taskId: "TK-R", phase: "waiting_approval", taskUpdatedAt: 20, queuePosition: null },
+    { sessionId: "CX-Q", taskId: "TK-Q", phase: "queued", taskUpdatedAt: 10, queuePosition: 0 },
+  ]);
+  assert.equal(Object.isFrozen(scheduler.activitySnapshot()), true);
+});
+
+test("store enriches only matching bounded scheduler references", () => {
+  withStore((store) => {
+    const session = store.createSession({ executor: "codex", projectAlias: "unity_asset", projectPath: "D:\\WA\\unity_asset", name: "active" });
+    const task = store.createTask({ sessionId: session.id, messageId: "om-active", action: "new", content: "work" });
+    const [row] = store.enrichActivitySnapshot([{ sessionId: session.id, taskId: task.id, phase: "running" }]);
+    assert.equal(row.sessionId, session.id);
+    assert.equal(row.status, "running");
+    assert.equal(row.agent, "codex");
+    assert.deepEqual(store.enrichActivitySnapshot([{ sessionId: session.id, taskId: "missing", phase: "running" }]), []);
+    assert.throws(() => store.enrichActivitySnapshot(new Array(202)), /invalid/);
   });
 });
 
