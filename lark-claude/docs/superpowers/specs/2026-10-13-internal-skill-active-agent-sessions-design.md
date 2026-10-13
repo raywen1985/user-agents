@@ -1,7 +1,7 @@
 # Internal Skill Routing and Active Agent Sessions Design
 
 Date: 2026-10-13
-Status: Approved for specification review
+Status: Revised for specification review
 
 ## Problem
 
@@ -85,6 +85,15 @@ that explicitly ask for all currently working agents on the PC route to
 `list_active_agent_sessions`. Unsupported project-independent requests remain
 `unknown` and receive help text that lists registered internal skills.
 
+`list_active_agent_sessions` is argument-free. For this action, `executor`,
+`project_alias`, `session_ref`, `session_name`, `request_ref`, and `content`
+must all be null, and `needs_clarification` must be false. The resolver enforces
+that invariant independently of the router. An explicit, otherwise pure active
+session query wins over reply binding and does not inherit the replied session.
+If the same message also names a project/executor/session or asks for additional
+work, the router returns `clarify` and asks the user to send the session query
+and the project work separately. It must not silently drop either intent.
+
 ## Internal Skill Registry
 
 A focused module owns a static map from skill name to metadata and handler. The
@@ -94,8 +103,8 @@ named by a message.
 
 Handlers receive explicit dependencies from the gateway. They do not receive a
 shell, an executor, or unrestricted message content. The first handler receives
-only the gateway store and provider-specific filesystem/process adapters needed
-for the read-only query.
+only a scheduler activity snapshot and provider-specific filesystem/process
+adapters needed for the read-only query.
 
 Internal skills execute inline rather than creating a gateway session or task.
 The gateway sends one global response keyed by the inbound message ID, using the
@@ -110,7 +119,9 @@ is merely open and idle.
 
 Provider rules are:
 
-- Gateway: session status is `queued`, `running`, or `waiting_approval`.
+- Gateway: the current scheduler process contains a queued or active task for
+  the session. Active task phase is read from the current store row and exposed
+  as `running` or `waiting_approval`; queued work is exposed as `queued`.
 - Codex: the latest persisted turn status is `inProgress`, and the matching
   thread writer lock is currently held. The lock requirement removes abandoned
   `inProgress` rows left by an abnormal exit.
@@ -127,17 +138,41 @@ attention. Idle native clients and historical session files are excluded.
 
 ### Gateway sessions
 
-The store adds a bounded query for the active status set. Each row is normalized
-with gateway ID, executor, name, project alias/path, native ID, status, and last
-update time.
+Persisted session status is not used to decide activity. A continuation can be
+queued while its session still says `completed`, and a process crash can leave
+persisted `queued` rows after the in-memory queue is lost. The scheduler instead
+exposes a read-only snapshot of its current `queue` and `active` maps. The
+snapshot contains task/session IDs and queue position only; the collector joins
+those IDs to current store rows for display metadata.
+
+Multiple scheduler entries for one session collapse to one record. Phase
+precedence is `waiting_approval`, `running`, then `queued`; ties use the newest
+task timestamp and then task ID. Startup recovery remains unchanged because
+stale persisted rows cannot enter this snapshot. Each record is normalized with
+gateway ID, executor, name, project alias/path, native ID, phase, and newest
+active-task timestamp.
 
 ### Codex sessions
 
-The collector reads the current per-user Codex data directory. It discovers the
-newest compatible `thread_history_*.sqlite` and `state_*.sqlite` generations,
-opens them read-only, and validates the required tables and columns before
-querying. It obtains the latest turn per thread from `thread_turns`, filters for
-`inProgress`, and joins display metadata from `threads`.
+The collector reads the current per-user Codex data directory. For each database
+family it parses the numeric suffix and selects the highest generation. It does
+not fall back to an older compatible generation: if the highest generation is
+incompatible, the Codex provider returns a compatibility warning rather than
+reporting stale data.
+
+The selected databases are opened with Node SQLite in read-only mode, followed
+by `PRAGMA query_only=ON` and `PRAGMA busy_timeout=250`. They are not opened as
+immutable because current WAL content must remain visible. The collector
+validates the exact required tables and columns before querying. The latest turn
+per thread is selected by `rollout_ordinal DESC`, then `started_at DESC`, then
+`turn_id ASC`; candidates are limited to 200 after filtering the latest row to
+exact status `inProgress`.
+
+Display metadata is a left join or a separate bounded lookup from `threads`.
+Only `name`, `cwd`, and `updated_at_ms` are allowed. `title`, `preview`,
+`first_user_message`, rollout bodies, and item content are never read. A missing
+metadata row does not remove an otherwise active thread; it is shown with its
+thread ID and unknown working directory.
 
 Codex App Server remains the supported integration for creating and controlling
 gateway-owned Codex work. It is not used for this cross-process query: the
@@ -146,11 +181,12 @@ separate process reports desktop-loaded threads as `notLoaded`. The local
 history/lock intersection is therefore required for desktop sessions owned by
 another process.
 
-For each candidate thread, the collector checks the corresponding
-`thread-writer-locks/<thread-id>.lock`. On Windows it attempts a non-mutating
-exclusive open: a sharing violation means another process currently owns the
-lock. Missing or freely openable locks are treated as stale. Other I/O errors
-fail the Codex provider rather than being guessed as active.
+For each candidate thread, the collector validates the ID as a UUID-like lower-
+case hexadecimal identifier and checks the fixed
+`thread-writer-locks/<thread-id>.lock` path through the Windows probe described
+below. A sharing violation means another process currently owns the lock.
+Missing or freely openable locks are stale. Access denied and unexpected I/O
+errors fail the Codex provider rather than being guessed as active.
 
 ### Claude Code sessions
 
@@ -158,12 +194,41 @@ The collector enumerates only `~/.claude/sessions/*.json`. It validates the
 minimum fields (`pid`, `sessionId`, `cwd`, `status`, and process-start identity)
 and rejects malformed files independently.
 
-Liveness is checked without WMI command-line access. The process adapter first
-checks that the PID exists, then compares the registry's process-start identity
-with the current process instance where the platform exposes it. A reused PID,
-missing process, mismatched start identity, idle state, or terminal state is not
-active. The collector reads an optional name from the registry and never parses
+Liveness is checked without WMI command-line access. The registry `procStart`
+value is defined as the unsigned decimal Windows FILETIME creation timestamp
+returned by `GetProcessTimes`, combining the high and low 32-bit values into one
+64-bit value. The process probe opens the PID with
+`PROCESS_QUERY_LIMITED_INFORMATION`, obtains that creation time, and compares
+its decimal representation exactly. A reused PID, missing process, mismatched
+start identity, idle state, or terminal state is not active. Access denied or an
+unexpected process error fails the Claude provider instead of treating the PID
+as live. The collector reads an optional name from the registry and never parses
 conversation content for display.
+
+### Windows native probe
+
+Node's ordinary `fs.open` does not express Windows `FileShare.None`, and Node
+does not expose another process's exact creation FILETIME. Production therefore
+uses one repository-owned `scripts/session-probe.ps1` subprocess per skill run.
+The gateway launches the fixed system executable
+`%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe` directly with
+`-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File <fixed-path>`;
+there is no shell and no message-derived command or path.
+
+The helper accepts one bounded JSON request on stdin containing validated lock
+paths and numeric PIDs, and returns one JSON object on stdout. Its embedded C#
+P/Invoke uses `OpenProcess`, `GetProcessTimes`, and `CloseHandle`; lock checks use
+`System.IO.File.Open(..., FileMode.Open, FileAccess.Read,
+FileShare.None)`. Every file stream and native handle is closed in `finally`.
+Windows error 2 maps to `missing`, 5 to `accessDenied`, 6 to `exited`, and 32/33
+to `held`; other codes are `error` with only the numeric code. A successful
+exclusive open maps to `free` and never writes the file.
+
+All lock and process checks are serialized inside that one helper invocation to
+bound handle use. Input is capped at 512 total probes, stdout at 256 KiB, and the
+subprocess deadline is three seconds. Timeout, nonzero exit, invalid JSON,
+duplicate/missing result IDs, or extra stdout fails the affected native
+providers. Stderr is retained only as a bounded local diagnostic.
 
 ## Normalization and Deduplication
 
@@ -175,13 +240,24 @@ Every provider returns records with this internal shape:
 - `name`, `status`, `cwd`, optional project alias, optional PID;
 - `updatedAt` when available.
 
-Gateway rows are normalized first. When a gateway row has a native ID matching a
-Codex or Claude record, the two records are merged. The result keeps the gateway
-ID for remote follow-up and the native metadata for diagnostics. It is labeled
-as a gateway-managed Codex or Claude session rather than displayed twice.
+Gateway rows are normalized first. Native IDs are trimmed and lower-cased after
+format validation. Deduplication keys are `(agent, normalizedNativeId)`, never
+the native ID alone. When a gateway row's executor and native ID match a native
+record, the records merge. The result keeps gateway name, project alias/path,
+and gateway IDs; native cwd, PID, and provider update time fill fields the
+gateway does not own. Gateway phase wins status precedence because it describes
+the remotely managed task.
 
-Remaining native records are sorted by provider and most recent activity. The
-formatter bounds names and paths with the existing sanitization helpers. A
+If multiple active gateway records map to the same native key, they collapse by
+phase precedence, newest active-task timestamp, then lexicographically smallest
+gateway ID. Up to three gateway IDs are retained for diagnostics with a bounded
+`+N` marker. An invalid native ID is never used as a merge key.
+
+All records are sorted deterministically by status priority
+(`waiting_approval`, `running`, unknown live non-terminal, `queued`), then
+`updatedAt` descending with missing values last, agent name, normalized primary
+ID, and gateway ID. The formatter bounds names and paths with the existing
+sanitization helpers. A
 record contains agent type, name, state, IDs, project or working directory, and
 PID when available. When there are no active records, the response says so
 explicitly.
@@ -189,14 +265,25 @@ explicitly.
 ## Partial Failure Behavior
 
 Providers are collected independently with `Promise.allSettled` or equivalent
-isolation. A provider failure yields one concise warning line after successful
-records. It does not turn the whole skill into a failure unless every provider
-fails.
+isolation and explicit deadlines. Codex and Claude collection each have a four-
+second deadline, the shared Windows helper has a three-second deadline, and the
+whole skill has a five-second deadline. A provider failure yields one concise
+warning line after successful records. It does not turn the whole skill into a
+failure unless every provider fails.
 
 Malformed individual Claude registry files are skipped and counted. A missing
 provider directory means that provider has no active sessions. Missing or
 incompatible Codex databases are reported as a Codex-source warning because
 silently returning an empty list would be misleading.
+
+Claude files are sorted by modification time descending, capped at 256 files,
+and capped at 64 KiB per file. Codex returns at most 200 active candidates from
+SQL. The normalized aggregate is capped at 200 records before deduplication and
+30 displayed records after sorting. Names are capped at 80 characters, paths at
+180, each provider diagnostic at 200, total diagnostics at three, and the final
+message at 12,000 characters. Deterministic truncation uses an explicit
+`... N additional active sessions not shown` line. Hitting an input cap also
+adds a provider warning so an incomplete result is never presented as complete.
 
 Errors sent to Lark contain the provider name and a bounded category, not raw
 database contents, environment values, command lines, or credentials.
@@ -209,8 +296,12 @@ database contents, environment values, command lines, or credentials.
 - `src/internal-skills.mjs`: own the static registry and dispatch contract.
 - `src/active-agent-sessions.mjs`: collect, normalize, deduplicate, and format
   provider results.
-- `src/store.mjs`: add an active gateway-session query.
+- `src/scheduler.mjs`: expose a bounded read-only snapshot of in-memory queued
+  and active entries.
+- `src/store.mjs`: support bounded joins from scheduler task/session IDs to
+  current display metadata.
 - `src/gateway.mjs`: inject the registry and handle resolved internal skills.
+- `scripts/session-probe.ps1`: provide the fixed Windows lock/process probe.
 - `test/`: cover routing, provider detection, stale filtering, deduplication,
   partial failures, and output bounds using temporary fixtures/adapters.
 - `README.md`: document the supported natural-language query and allowlist
@@ -224,6 +315,8 @@ database contents, environment values, command lines, or credentials.
 - The active-session skill is read-only and uses fixed per-user data roots.
 - SQLite databases are opened read-only; lock files are never written or
   deleted.
+- The Windows helper receives only collector-validated fixed-root lock paths and
+  numeric PIDs; it exposes no generic command execution operation.
 - No process is signaled, resumed, cancelled, or inspected for full command-line
   contents.
 - Output excludes prompts, conversation bodies, environment data, and secrets.
@@ -237,16 +330,29 @@ Automated tests will cover:
 - exact and synonymous active-agent queries resolve to the registered skill;
 - unrelated project-independent requests cannot invoke a handler;
 - an invented or missing `skill_name` is rejected by the resolver/registry;
+- mixed project/internal requests clarify instead of dropping either action;
+- reply context does not redirect a pure explicit internal query;
+- prompt-injection text cannot invent a skill, arguments, or handler;
 - project tasks still require the existing executor and registered project;
-- gateway active statuses are included and terminal statuses are excluded;
+- gateway activity comes from the current scheduler snapshot, not stale session
+  status, and multiple tasks collapse with the defined precedence;
 - Codex `inProgress` plus a held writer lock is included;
 - stale Codex `inProgress` rows without a held lock are excluded;
+- the highest Codex database generation is selected without fallback, latest
+  turn ordering is deterministic, WAL rows are visible, and missing metadata is
+  retained without reading conversational columns;
 - Claude live, start-identity-matching non-idle sessions are included;
 - dead, PID-reused, idle, terminal, and malformed Claude sessions are excluded;
-- gateway/native records are merged by native ID;
+- gateway/native records merge only by `(agent, normalized native ID)`, with
+  deterministic conflict, field, status, and ordering rules;
 - one provider failure preserves other results and adds a bounded warning;
 - all-provider failure returns a clear query failure;
-- names, paths, errors, and record counts are bounded and sanitized.
+- deadlines, file/row/probe/result/output caps produce deterministic warnings
+  and truncation markers;
+- Windows-only integration tests invoke the real helper against a temporary
+  freely openable file, a file held with `FileShare.None`, the test process with
+  its exact `GetProcessTimes` value, a deliberately wrong start value, and a
+  terminated process. Mock adapters remain for platform-independent unit tests.
 
 Verification will run the Node test suite, exercise the collector against the
 current PC in read-only mode, restart the gateway, and send a Feishu query using
