@@ -103,8 +103,12 @@ named by a message.
 
 Handlers receive explicit dependencies from the gateway. They do not receive a
 shell, an executor, or unrestricted message content. The first handler receives
-only a scheduler activity snapshot and provider-specific filesystem/process
-adapters needed for the read-only query.
+only an enriched immutable scheduler activity snapshot and provider-specific
+filesystem/process adapters needed for the read-only query. The gateway obtains
+ID/phase references from the scheduler, resolves those IDs through the store,
+copies only the allowlisted display fields into plain objects, freezes the
+result, and then dispatches the handler. The handler receives neither the store
+nor the mutable scheduler.
 
 Internal skills execute inline rather than creating a gateway session or task.
 The gateway sends one global response keyed by the inbound message ID, using the
@@ -142,8 +146,14 @@ Persisted session status is not used to decide activity. A continuation can be
 queued while its session still says `completed`, and a process crash can leave
 persisted `queued` rows after the in-memory queue is lost. The scheduler instead
 exposes a read-only snapshot of its current `queue` and `active` maps. The
-snapshot contains task/session IDs and queue position only; the collector joins
-those IDs to current store rows for display metadata.
+snapshot contains task/session IDs, queue position, and phase only. The gateway
+joins those IDs to current store rows before skill dispatch as described above.
+
+The scheduler adds `sessionId` and `taskId` to each `approvalWaiters` entry.
+`activitySnapshot()` labels an active entry `waiting_approval` when a current
+waiter has the same session/task pair; otherwise it is `running`. This is the
+sole source of the waiting phase. The task row may remain `running`, and session
+status is display metadata only, never the phase source.
 
 Multiple scheduler entries for one session collapse to one record. Phase
 precedence is `waiting_approval`, `running`, then `queued`; ties use the newest
@@ -165,8 +175,17 @@ by `PRAGMA query_only=ON` and `PRAGMA busy_timeout=250`. They are not opened as
 immutable because current WAL content must remain visible. The collector
 validates the exact required tables and columns before querying. The latest turn
 per thread is selected by `rollout_ordinal DESC`, then `started_at DESC`, then
-`turn_id ASC`; candidates are limited to 200 after filtering the latest row to
-exact status `inProgress`.
+`turn_id ASC`. After filtering the latest row to exact status `inProgress`,
+candidates are ordered by `COALESCE(started_at, 0) DESC`, then
+`rollout_ordinal DESC`, then `thread_id ASC`. The query requests 201 rows,
+returns the first 200, and emits a truncation warning when row 201 exists.
+
+All synchronous Codex SQLite work runs in a dedicated
+`src/active-agent-codex-worker.mjs` Worker thread. The parent passes only the
+selected fixed-root database paths and numeric limits. The worker validates and
+queries the databases, posts a structured result, and closes every database in
+`finally`. The parent terminates it at the four-second Codex deadline, so a
+stalled synchronous query cannot block the gateway event loop.
 
 Display metadata is a left join or a separate bounded lookup from `threads`.
 Only `name`, `cwd`, and `updated_at_ms` are allowed. `title`, `preview`,
@@ -220,9 +239,11 @@ paths and numeric PIDs, and returns one JSON object on stdout. Its embedded C#
 P/Invoke uses `OpenProcess`, `GetProcessTimes`, and `CloseHandle`; lock checks use
 `System.IO.File.Open(..., FileMode.Open, FileAccess.Read,
 FileShare.None)`. Every file stream and native handle is closed in `finally`.
-Windows error 2 maps to `missing`, 5 to `accessDenied`, 6 to `exited`, and 32/33
-to `held`; other codes are `error` with only the numeric code. A successful
-exclusive open maps to `free` and never writes the file.
+Windows error 2 maps to `missing`, 5 to `accessDenied`, 32/33 to `held`, and 87
+from `OpenProcess` maps to `exited` after PID validation. Error 6 from a later
+native-handle operation also maps to `exited` to cover a process-exit race.
+Other codes are `error` with only the numeric code. A successful exclusive open
+maps to `free` and never writes the file.
 
 All lock and process checks are serialized inside that one helper invocation to
 bound handle use. Input is capped at 512 total probes, stdout at 256 KiB, and the
@@ -253,6 +274,13 @@ phase precedence, newest active-task timestamp, then lexicographically smallest
 gateway ID. Up to three gateway IDs are retained for diagnostics with a bounded
 `+N` marker. An invalid native ID is never used as a merge key.
 
+Native records are deduplicated before gateway merging. For duplicate
+`(agent, normalizedNativeId)` keys, choose status priority first, then
+`updatedAt` descending, provider source path by lower-cased ordinal order and
+then original ordinal order, PID ascending with missing last, and normalized ID.
+The winner supplies native name/cwd/PID fields. Duplicate count is retained only
+for bounded local diagnostics and is not displayed as separate sessions.
+
 All records are sorted deterministically by status priority
 (`waiting_approval`, `running`, unknown live non-terminal, `queued`), then
 `updatedAt` descending with missing values last, agent name, normalized primary
@@ -271,17 +299,30 @@ whole skill has a five-second deadline. A provider failure yields one concise
 warning line after successful records. It does not turn the whole skill into a
 failure unless every provider fails.
 
+At the five-second deadline the parent aborts pending asynchronous file work,
+terminates the Codex Worker, and kills the Windows helper process tree through
+the existing process utility. It formats already completed gateway/provider
+results plus one timeout warning per unfinished provider. No synchronous SQLite
+operation runs on the gateway thread.
+
 Malformed individual Claude registry files are skipped and counted. A missing
 provider directory means that provider has no active sessions. Missing or
 incompatible Codex databases are reported as a Codex-source warning because
 silently returning an empty list would be misleading.
 
-Claude files are sorted by modification time descending, capped at 256 files,
-and capped at 64 KiB per file. Codex returns at most 200 active candidates from
-SQL. The normalized aggregate is capped at 200 records before deduplication and
-30 displayed records after sorting. Names are capped at 80 characters, paths at
-180, each provider diagnostic at 200, total diagnostics at three, and the final
-message at 12,000 characters. Deterministic truncation uses an explicit
+Claude files are sorted by modification time descending, then lower-cased full
+path ordinal ascending, then original full path ordinal ascending. Enumeration
+is capped at 256 files and each file at 64 KiB. It produces at most 200 active
+records and reads one additional qualifying record to detect truncation. Codex
+returns at most 200 active candidates as described above. Gateway scheduler
+references are ordered by phase, task timestamp, session ID, and task ID; the
+snapshot retains 200 plus one to detect truncation.
+
+Provider records are deduplicated and globally sorted before applying a
+200-record aggregate cap. The formatter displays the first 30. Names are capped
+at 80 characters, paths at 180, each provider diagnostic at 200, total
+diagnostics at three, and the final message at 12,000 characters. Deterministic
+truncation uses an explicit
 `... N additional active sessions not shown` line. Hitting an input cap also
 adds a provider warning so an incomplete result is never presented as complete.
 
@@ -297,10 +338,12 @@ database contents, environment values, command lines, or credentials.
 - `src/active-agent-sessions.mjs`: collect, normalize, deduplicate, and format
   provider results.
 - `src/scheduler.mjs`: expose a bounded read-only snapshot of in-memory queued
-  and active entries.
+  and active entries, including approval-wait phase from `approvalWaiters`.
 - `src/store.mjs`: support bounded joins from scheduler task/session IDs to
   current display metadata.
 - `src/gateway.mjs`: inject the registry and handle resolved internal skills.
+- `src/active-agent-codex-worker.mjs`: isolate synchronous Codex SQLite reads in
+  a deadline-terminable Worker.
 - `scripts/session-probe.ps1`: provide the fixed Windows lock/process probe.
 - `test/`: cover routing, provider detection, stale filtering, deduplication,
   partial failures, and output bounds using temporary fixtures/adapters.
@@ -335,12 +378,15 @@ Automated tests will cover:
 - prompt-injection text cannot invent a skill, arguments, or handler;
 - project tasks still require the existing executor and registered project;
 - gateway activity comes from the current scheduler snapshot, not stale session
-  status, and multiple tasks collapse with the defined precedence;
+  status; approval waiters define waiting phase, gateway enrichment occurs
+  before dispatch, and multiple tasks collapse with the defined precedence;
 - Codex `inProgress` plus a held writer lock is included;
 - stale Codex `inProgress` rows without a held lock are excluded;
 - the highest Codex database generation is selected without fallback, latest
   turn ordering is deterministic, WAL rows are visible, and missing metadata is
   retained without reading conversational columns;
+- a deliberately blocked/slow Codex Worker is terminated without blocking the
+  gateway event loop, and completed providers still format at the total deadline;
 - Claude live, start-identity-matching non-idle sessions are included;
 - dead, PID-reused, idle, terminal, and malformed Claude sessions are excluded;
 - gateway/native records merge only by `(agent, normalized native ID)`, with
@@ -352,7 +398,11 @@ Automated tests will cover:
 - Windows-only integration tests invoke the real helper against a temporary
   freely openable file, a file held with `FileShare.None`, the test process with
   its exact `GetProcessTimes` value, a deliberately wrong start value, and a
-  terminated process. Mock adapters remain for platform-independent unit tests.
+  terminated process whose validated positive PID produces error 87. Mock
+  adapters remain for platform-independent unit tests;
+- equal-mtime Claude files, the 201st Codex/Claude candidate, the 201st scheduler
+  entry, duplicate native keys, and post-dedup aggregate truncation all follow
+  the documented deterministic order and emit the required warning.
 
 Verification will run the Node test suite, exercise the collector against the
 current PC in read-only mode, restart the gateway, and send a Feishu query using
