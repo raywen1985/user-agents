@@ -66,8 +66,9 @@
 
 ## 幂等规则
 
-- Codex 优先使用 `turn_id`；Claude Code 优先使用 `prompt_id`，缺失时使用 `Get-ClaudeTurnRecord` 返回的逻辑 `turn_id`。
-- 如果上述 ID 均不可用，则对 `source + session_id + 规范化 transcript 路径 + event + notification_type + 脱敏摘要` 做确定性哈希；禁止用随机 GUID。
+- Codex 的 `event_identity` 优先使用 `turn_id`；Claude Code 优先使用 `prompt_id`，缺失时使用 `Get-ClaudeTurnRecord` 返回的逻辑 `turn_id`。
+- 如果上述 ID 均不可用，`event_identity` 为 `SHA256` 对 `source`、`session_id`、规范化 transcript 路径、`event`、`notification_type`、脱敏摘要组成的规范字段序列求得的十六进制值；禁止使用随机 GUID。
+- `seed` 始终由 `source`、`session_id`、`event_identity`、`event`、`notification_type` 组成。规范字段序列按固定顺序把每个字段编码为 UTF-8 的 `十进制字节长度:字段值`，字段之间不加可歧义的自由分隔符。事件名和通知类型始终参与，因此同一 Claude `prompt_id` 的等待通知和后续完成通知不会碰撞。
 - 卡片键为 `SHA256(seed + "|card")` 的前 40 位，纯文本回退键为 `SHA256(seed + "|fallback")` 的前 40 位。相同输入在飞书一小时幂等窗口内必须生成相同键。
 - 并发或重试不得改变键。
 
@@ -75,8 +76,8 @@
 
 - transcript 或 token-meter 不可用：仍发送卡片，对应指标显示 `--`。
 - Card 2.0 本地构造/验证失败：没有发出卡片请求，直接使用 fallback key 发送现有纯文本通知。
-- 飞书明确拒绝卡片请求（可解析的非网络 API 错误）：记录具体错误，然后使用 fallback key 发送现有纯文本通知。
-- 网络/transport/超时等结果不明确的失败：卡片可能已被服务端接受，为避免重复通知，不发送纯文本回退，只记录失败供排查。
+- 所有发送命令显式使用 `--format json` 并解析 typed envelope。仅当进程非零退出、JSON 可解析为 `ok:false`，且 `error.type` 为 `validation`、`api` 或 `authorization` 时，判定为明确未发送；记录具体错误，然后使用 fallback key 发送现有纯文本通知。
+- 进程启动失败、超时、输出为空或非 JSON、`error.type` 为网络/transport 类，或任何未知 `error.type`，都判定为结果不明确。卡片可能已被服务端接受，为避免重复通知，不发送纯文本回退，只记录失败供排查。
 - 卡片和纯文本都失败：记录最终失败；Hook 仍返回 `{}`，不阻断 Claude Code 或 Codex。
 - Claude Code 与 Codex 使用相同降级策略。
 - Card 2.0 正文完整显示要求飞书/Lark 客户端版本不低于 7.20；旧客户端只显示 Header 属于客户端能力限制，服务端成功响应无法触发自动纯文本回退。
@@ -86,10 +87,10 @@
 - PowerShell 单元测试覆盖三个当前可达状态的“事件过滤 -> 状态映射”端到端路径、卡片根结构、保留的普通默认态中性色和摘要精简。
 - 覆盖 Token 紧凑格式、命中率、USD 成本、耗时及不可用占位符。
 - 覆盖 JSON 特殊字符、长摘要、Windows 路径和 `file://` URI。
-- 覆盖 Claude Code 与 Codex 卡片发送参数、本地构造失败回退、明确 API 拒绝后单次文本回退、网络/transport 模糊失败不回退。
+- 覆盖 Claude Code 与 Codex 卡片发送参数、本地构造失败回退，以及 `validation`、`api`、`authorization` typed envelope 后单次文本回退；表驱动覆盖启动失败、超时、空输出、畸形 JSON、网络/transport 和未知错误类型均不回退。
 - 覆盖缺少 token-meter 模块、transcript 缺失/损坏/写入不完整、价格表缺失/损坏时仍发送卡片且统计显示 `--`，并断言通知解析不写 token history。
 - 覆盖卡片与文本都失败时仍输出 `{}` 且退出码为 0。
-- 覆盖相同输入重试和并发调用时 card/fallback key 稳定，并保留现有 Codex 内部目录、未持久会话和文件 URI 过滤测试。
+- 覆盖相同输入重试和并发调用时 card/fallback key 稳定；同一 Claude `prompt_id` 先发 `Notification` 再发 `Stop` 时两个 card key 必须不同。保留现有 Codex 内部目录、未持久会话和文件 URI 过滤测试。
 - 耗时 fixture 覆盖 Claude 多 turn、sidechain、Codex 同一 `turn_id` 多事件、缺失时间戳及结束时间早于开始时间。
 - 使用合成 Hook 输入执行 `-DryRun`，验证 Card JSON 可解析。
 - 经用户确认后向现有接收人发送一条测试卡片，验证飞书实际渲染。
