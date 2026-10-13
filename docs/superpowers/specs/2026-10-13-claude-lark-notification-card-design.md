@@ -1,0 +1,87 @@
+# Claude Code / Codex 飞书通知卡片设计
+
+## 目标
+
+把 Claude Code 和 Codex 的会话通知从纯文本升级为飞书 Card 2.0，在手机和桌面端兼顾快速扫读与排查信息。两种来源共用版式与语义色，标题、事件解析和统计解析按来源动态切换。
+
+## 状态与配色
+
+卡片根据 Hook 事件选择语义色：
+
+| 状态 | 触发条件 | Header 颜色 | 标签 |
+| --- | --- | --- | --- |
+| 完成 | `Stop` | `green` | 完成 |
+| 失败 | `StopFailure` | `red` | 失败 |
+| 等待操作 | `Notification` 且类型为 `permission_prompt`、`idle_prompt` 或 `agent_needs_input` | `orange` | 待处理 |
+| 普通 | 其他允许发送的 Claude 通知 | `default` | 通知 |
+
+普通通知不使用蓝色强调。颜色只表达状态，同一卡片不混用无关主色。
+
+## 信息结构
+
+使用 Card 2.0、`default` 宽度，无按钮和服务端回调。
+
+### Header
+
+- 标题：`<来源> 会话已完成`、`<来源> 会话失败`、`<来源> 等待你的操作` 或 `<来源> 通知`；来源为 `Claude Code` 或 `Codex`。
+- 副标题：`<项目名> · <本地时间>`。
+- 状态标签：完成、失败、待处理或通知。
+
+### Body
+
+1. 结果摘要高亮块
+   - 完成：标签为“执行结果”。
+   - 失败：标签为“失败原因”。
+   - 等待操作：标签为“需要确认”。
+   - 普通：标签为“消息”。
+   - 摘要使用现有脱敏和长度限制，不增加“请展开详细信息查看项目目录与会话上下文”等提示性填充。
+2. 关键指标
+   - 项目
+   - 耗时
+   - 消耗 Token
+   - 命中率
+   - 花费
+3. 默认折叠的“详细信息”
+   - 会话名
+   - 完整目录
+   - Hook 事件类型
+
+## 指标定义
+
+- `耗时`：当前 turn 的开始时间到最后一个结果事件时间。Claude Code 使用首条顶层用户消息到末条顶层助手消息；Codex 使用匹配 `turn_id` 的首个 turn 事件到末个 turn 事件。时间戳缺失或顺序无效时显示 `--`。
+- `消耗 Token`：`effective_input_tokens + generated_output_tokens`。数值用紧凑格式显示，例如 `464k`、`7.71M`；没有 provider-reported 数据时显示 `--`。
+- `命中率`：`cache_read_tokens / effective_input_tokens * 100`，显示整数百分比；分母为零或数据不可用时显示 `--`。
+- `花费`：复用 token-meter 的 `estimated_cost.total_usd`，显示为美元估算，例如 `$0.0327`；成本状态不是 `estimated` 时显示 `--`。
+
+这些数值是本地估算和 transcript 派生值，不作为供应商账单。
+
+## 数据流
+
+1. Claude Code 或 Codex 把 Hook JSON 写入通知脚本的 stdin。
+2. 通知脚本保留现有事件过滤、幂等键、脱敏和会话名解析。
+3. 根据来源从 transcript 计算耗时，并调用 token-meter 对应的只读解析逻辑获取本轮指标，不重复写 history。
+4. 生成 Card 2.0 JSON，使用 `lark-cli im +messages-send --msg-type interactive --content <json>` 发送。
+
+通知脚本不得依赖 token-meter 的 Stop Hook 已先执行。Hook 可能并发，因此统计数据必须直接从 transcript 计算，不能依赖 history 的写入时序。
+
+## 降级与错误处理
+
+- transcript 或 token-meter 不可用：仍发送卡片，对应指标显示 `--`。
+- Card 2.0 构造失败或发送失败：记录具体错误，然后用同一幂等种子派生独立 fallback key，回退发送现有纯文本通知。
+- 卡片和纯文本都失败：记录最终失败；Hook 仍返回 `{}`，不阻断 Claude Code。
+- Claude Code 与 Codex 使用相同降级策略。
+
+## 测试
+
+- PowerShell 单元测试覆盖四种状态映射、卡片根结构、普通状态中性色和摘要精简。
+- 覆盖 Token 紧凑格式、命中率、USD 成本、耗时及不可用占位符。
+- 覆盖 JSON 特殊字符、长摘要和 Windows 路径。
+- 覆盖 Claude Code 与 Codex 卡片发送参数，以及卡片失败后的纯文本回退。
+- 使用合成 Hook 输入执行 `-DryRun`，验证 Card JSON 可解析。
+- 经用户确认后向现有接收人发送一条测试卡片，验证飞书实际渲染。
+
+## 已批准视觉稿
+
+本地预览：`C:\Users\Administrator\.codex\visualizations\2026\10\10\01a12464-5a18-7fd2-bb52-fbf1e583088a\index.html`
+
+视觉稿已检查桌面和 390px 手机宽度，统计字段在手机端以两列换行，详细信息默认折叠。
