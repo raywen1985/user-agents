@@ -124,8 +124,9 @@ is merely open and idle.
 Provider rules are:
 
 - Gateway: the current scheduler process contains a queued or active task for
-  the session. Active task phase is read from the current store row and exposed
-  as `running` or `waiting_approval`; queued work is exposed as `queued`.
+  the session. Phase comes exclusively from the scheduler snapshot:
+  `approvalWaiters` produces `waiting_approval`, other active entries produce
+  `running`, and queued entries produce `queued`. Persisted status is not used.
 - Codex: the latest persisted turn status is `inProgress`, and the matching
   thread writer lock is currently held. The lock requirement removes abandoned
   `inProgress` rows left by an abnormal exit.
@@ -236,9 +237,14 @@ there is no shell and no message-derived command or path.
 
 The helper accepts one bounded JSON request on stdin containing validated lock
 paths and numeric PIDs, and returns one JSON object on stdout. Its embedded C#
-P/Invoke uses `OpenProcess`, `GetProcessTimes`, and `CloseHandle`; lock checks use
+P/Invoke uses `OpenProcess`, `GetExitCodeProcess`, `GetProcessTimes`, and
+`CloseHandle`; lock checks use
 `System.IO.File.Open(..., FileMode.Open, FileAccess.Read,
 FileShare.None)`. Every file stream and native handle is closed in `finally`.
+After `OpenProcess` succeeds, the helper calls `GetExitCodeProcess` and requires
+the exact `STILL_ACTIVE` value (259) before accepting the creation FILETIME.
+This excludes terminated process objects that remain open because another
+process still owns a handle.
 Windows error 2 maps to `missing`, 5 to `accessDenied`, 32/33 to `held`, and 87
 from `OpenProcess` maps to `exited` after PID validation. Error 6 from a later
 native-handle operation also maps to `exited` to cover a process-exit race.
@@ -398,8 +404,11 @@ Automated tests will cover:
 - Windows-only integration tests invoke the real helper against a temporary
   freely openable file, a file held with `FileShare.None`, the test process with
   its exact `GetProcessTimes` value, a deliberately wrong start value, and a
-  terminated process whose validated positive PID produces error 87. Mock
-  adapters remain for platform-independent unit tests;
+  terminated process whose validated positive PID produces error 87. A second
+  terminated-process test deliberately retains an external process handle so
+  `OpenProcess`/`GetProcessTimes` succeed and verifies that
+  `GetExitCodeProcess != STILL_ACTIVE` still returns `exited`. Mock adapters
+  remain for platform-independent unit tests;
 - equal-mtime Claude files, the 201st Codex/Claude candidate, the 201st scheduler
   entry, duplicate native keys, and post-dedup aggregate truncation all follow
   the documented deterministic order and emit the required warning.
