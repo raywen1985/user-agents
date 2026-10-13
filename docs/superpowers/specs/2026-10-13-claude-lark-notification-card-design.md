@@ -13,9 +13,9 @@
 | 完成 | `Stop` | `green` | 完成 |
 | 失败 | `StopFailure` | `red` | 失败 |
 | 等待操作 | `Notification` 且类型为 `permission_prompt`、`idle_prompt` 或 `agent_needs_input` | `orange` | 待处理 |
-| 普通 | 其他允许发送的 Claude 通知 | `default` | 通知 |
+| 普通 | 保留的默认视觉态；本次不新增生产事件类型 | `default` | 通知 |
 
-普通通知不使用蓝色强调。颜色只表达状态，同一卡片不混用无关主色。
+普通通知不使用蓝色强调。颜色只表达状态，同一卡片不混用无关主色。本次保留现有事件过滤：Claude Code 只发送 `Stop`、`StopFailure` 和三种需要操作的 `Notification`；Codex 只发送已通过现有持久会话过滤的完成事件。普通态仅用于构造器默认分支和未来兼容，不扩大当前通知范围。
 
 ## 信息结构
 
@@ -51,32 +51,46 @@
 - `耗时`：当前 turn 的开始时间到最后一个结果事件时间。Claude Code 使用首条顶层用户消息到末条顶层助手消息；Codex 使用匹配 `turn_id` 的首个 turn 事件到末个 turn 事件。时间戳缺失或顺序无效时显示 `--`。
 - `消耗 Token`：`effective_input_tokens + generated_output_tokens`。数值用紧凑格式显示，例如 `464k`、`7.71M`；没有 provider-reported 数据时显示 `--`。
 - `命中率`：`cache_read_tokens / effective_input_tokens * 100`，显示整数百分比；分母为零或数据不可用时显示 `--`。
-- `花费`：复用 token-meter 的 `estimated_cost.total_usd`，显示为美元估算，例如 `$0.0327`；成本状态不是 `estimated` 时显示 `--`。
+- `花费`：先用 `Get-ClaudeTurnRecord` 或 `Get-CodexTurnRecord` 取得只读记录，再调用 `Get-TMEstimatedCost`；绝不调用 `Save-TMTurnRecord`。仅当成本状态为 `estimated` 时显示 `total_usd`，例如 `$0.0327`，否则显示 `--`。
 
 这些数值是本地估算和 transcript 派生值，不作为供应商账单。
 
 ## 数据流
 
 1. Claude Code 或 Codex 把 Hook JSON 写入通知脚本的 stdin。
-2. 通知脚本保留现有事件过滤、幂等键、脱敏和会话名解析。
-3. 根据来源从 transcript 计算耗时，并调用 token-meter 对应的只读解析逻辑获取本轮指标，不重复写 history。
+2. 通知脚本保留现有事件过滤、脱敏和会话名解析；先把本地路径或 `file://` URI 统一规范化为本地绝对路径，再交给会话校验、耗时解析和 token-meter。
+3. 根据来源从 transcript 计算耗时，并调用 token-meter 对应的只读解析逻辑获取本轮指标，不重复写 history。Token 和命中率仅接受 `PROVIDER_REPORTED` 或 `DERIVED_REPORTED` 质量的数据。
 4. 生成 Card 2.0 JSON，使用 `lark-cli im +messages-send --msg-type interactive --content <json>` 发送。
 
 通知脚本不得依赖 token-meter 的 Stop Hook 已先执行。Hook 可能并发，因此统计数据必须直接从 transcript 计算，不能依赖 history 的写入时序。
 
+## 幂等规则
+
+- Codex 优先使用 `turn_id`；Claude Code 优先使用 `prompt_id`，缺失时使用 `Get-ClaudeTurnRecord` 返回的逻辑 `turn_id`。
+- 如果上述 ID 均不可用，则对 `source + session_id + 规范化 transcript 路径 + event + notification_type + 脱敏摘要` 做确定性哈希；禁止用随机 GUID。
+- 卡片键为 `SHA256(seed + "|card")` 的前 40 位，纯文本回退键为 `SHA256(seed + "|fallback")` 的前 40 位。相同输入在飞书一小时幂等窗口内必须生成相同键。
+- 并发或重试不得改变键。
+
 ## 降级与错误处理
 
 - transcript 或 token-meter 不可用：仍发送卡片，对应指标显示 `--`。
-- Card 2.0 构造失败或发送失败：记录具体错误，然后用同一幂等种子派生独立 fallback key，回退发送现有纯文本通知。
-- 卡片和纯文本都失败：记录最终失败；Hook 仍返回 `{}`，不阻断 Claude Code。
+- Card 2.0 本地构造/验证失败：没有发出卡片请求，直接使用 fallback key 发送现有纯文本通知。
+- 飞书明确拒绝卡片请求（可解析的非网络 API 错误）：记录具体错误，然后使用 fallback key 发送现有纯文本通知。
+- 网络/transport/超时等结果不明确的失败：卡片可能已被服务端接受，为避免重复通知，不发送纯文本回退，只记录失败供排查。
+- 卡片和纯文本都失败：记录最终失败；Hook 仍返回 `{}`，不阻断 Claude Code 或 Codex。
 - Claude Code 与 Codex 使用相同降级策略。
+- Card 2.0 正文完整显示要求飞书/Lark 客户端版本不低于 7.20；旧客户端只显示 Header 属于客户端能力限制，服务端成功响应无法触发自动纯文本回退。
 
 ## 测试
 
-- PowerShell 单元测试覆盖四种状态映射、卡片根结构、普通状态中性色和摘要精简。
+- PowerShell 单元测试覆盖三个当前可达状态的“事件过滤 -> 状态映射”端到端路径、卡片根结构、保留的普通默认态中性色和摘要精简。
 - 覆盖 Token 紧凑格式、命中率、USD 成本、耗时及不可用占位符。
-- 覆盖 JSON 特殊字符、长摘要和 Windows 路径。
-- 覆盖 Claude Code 与 Codex 卡片发送参数，以及卡片失败后的纯文本回退。
+- 覆盖 JSON 特殊字符、长摘要、Windows 路径和 `file://` URI。
+- 覆盖 Claude Code 与 Codex 卡片发送参数、本地构造失败回退、明确 API 拒绝后单次文本回退、网络/transport 模糊失败不回退。
+- 覆盖缺少 token-meter 模块、transcript 缺失/损坏/写入不完整、价格表缺失/损坏时仍发送卡片且统计显示 `--`，并断言通知解析不写 token history。
+- 覆盖卡片与文本都失败时仍输出 `{}` 且退出码为 0。
+- 覆盖相同输入重试和并发调用时 card/fallback key 稳定，并保留现有 Codex 内部目录、未持久会话和文件 URI 过滤测试。
+- 耗时 fixture 覆盖 Claude 多 turn、sidechain、Codex 同一 `turn_id` 多事件、缺失时间戳及结束时间早于开始时间。
 - 使用合成 Hook 输入执行 `-DryRun`，验证 Card JSON 可解析。
 - 经用户确认后向现有接收人发送一条测试卡片，验证飞书实际渲染。
 
