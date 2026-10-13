@@ -1,7 +1,7 @@
 # Stop Active Agent Session Internal Skill Design
 
 Date: 2026-10-13
-Status: Approved after specification review; pending user review
+Status: Approved after specification review and user review
 
 ## Problem
 
