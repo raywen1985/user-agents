@@ -440,9 +440,9 @@ these columns:
   `127.0.0.1`, or `::1`, otherwise `non_loopback`; the raw address is not
   emitted;
 - `listen_port`: integer from 1 through 65535;
-- `updated_at`: SQLite `text` containing 1-64 bytes of RFC 3339 with an
-  explicit `Z` or numeric offset; it must parse to a finite instant no more than
-  five minutes in the future and is emitted normalized to UTC.
+- `updated_at`: SQLite `text` in CC Switch's exact UTC format
+  `YYYY-MM-DD HH:mm:ss`; it must round-trip as a valid instant no more than five
+  minutes in the future and is emitted as RFC 3339 normalized to UTC.
 
 `enabled` is labeled as the row's master enabled state and `proxy_enabled` as
 the local proxy state; V1 does not infer one from the other. Failover output is
