@@ -113,6 +113,12 @@ PowerShell 没有内置 TOML 写入 API，因此这里只实现受限的顶层 `
 
 计划任务不发送测试消息。配置正确时不重写任何文件；只有缺失、被 Codex 更新覆盖或原生运行时路径发生变化时才修复。任务仍以普通用户、隐藏窗口运行。配置更改对新 Turn 是否热加载由 Codex 客户端决定；bootstrap 在日志中记录“已修复，当前已运行会话若未热加载则下次启动生效”，但不自动终止或重启 Codex。
 
+### 无闪窗启动
+
+任务计划程序不再直接启动控制台子系统的 `powershell.exe`。即使使用 `-WindowStyle Hidden`，Windows 仍可能在隐藏窗口前短暂创建控制台，导致每 10 分钟闪现一次命令窗口。
+
+新增 `Run-LarkNotifyBootstrap.vbs` 作为无控制台启动器。计划任务通过系统目录下的绝对 `wscript.exe` 路径及 `//B //Nologo "<launcher>"` 参数调用该启动器。启动器从自身目录解析初始化脚本，使用 `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`，以窗口样式 `0` 同步执行 `-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "<initializer>"`，并通过 `WScript.Quit` 透传 PowerShell 退出码。所有可执行文件与脚本路径均按 Windows 命令行规则加双引号，不依赖当前工作目录或 `PATH`。这样保留现有登录触发、每 10 分钟自检、任务最近结果和失败重试语义，同时避免创建可见控制台窗口；启动器自身无法创建进程时也必须返回非零退出码。
+
 ## 测试
 
 新增桥接器测试并扩展 bootstrap 测试，全部使用临时目录、伪造原生程序和 `-DryRun`/测试注入，不访问飞书网络：
@@ -131,6 +137,7 @@ PowerShell 没有内置 TOML 写入 API，因此这里只实现受限的顶层 `
 - 未持久化内部 Turn 被跳过；索引延迟但在有界重试中出现时正常发送。
 - Claude Code 三类 Hook 缺失、参数漂移、重复和被启动后再次删除时，bootstrap 能恢复为一个发送路径；未知配置保持不变。
 - Claude Code `Stop`、`StopFailure`、三种允许的 `Notification` 和其他被过滤的 `Notification` 使用隔离负载验证，且不访问飞书网络。
+- 计划任务动作使用系统绝对路径的 `wscript.exe //B //Nologo` 调用固定的 VBS 启动器，不直接启动控制台程序；启动器保留 PowerShell 的非交互与执行策略参数，以隐藏窗口执行并透传退出码。测试覆盖含空格路径、PowerShell 返回 0、返回非零和进程启动失败。
 
 ## 验收
 
