@@ -1,22 +1,33 @@
-# Codex 飞书通知双路转发设计
+# Claude Code 与 Codex 飞书通知可靠性设计
 
 ## 背景与根因
 
-Windows 重启并启动新版 Codex Desktop 后，用户级 `~/.codex/config.toml` 中的 `notify` 被配置为 Codex 自带的 `codex-computer-use.exe turn-ended`。现有飞书通知仅注册在 `~/.codex/hooks.json` 的 `Stop` Hook 中。实际日志显示飞书脚本最后一次被 Codex 调用停在 2026-10-15 09:02，之后没有成功、失败或跳过记录；飞书机器人身份仍为 `bot`，状态为 `available=true`、`tokenStatus=ready`。
+现有通知系统同时服务 Claude Code 与 Codex。Claude Code 通过 `~/.claude/settings.json` 的 `Stop`、`StopFailure` 和 `Notification` Hook 调用公共飞书脚本；Codex 原先通过 `~/.codex/hooks.json` 的 `Stop` Hook 调用同一脚本。
+
+Windows 重启并启动新版 Codex Desktop 后，用户级 `~/.codex/config.toml` 中的 `notify` 被配置为 Codex 自带的 `codex-computer-use.exe turn-ended`。实际日志显示飞书脚本最后一次被 Codex 调用停在 2026-10-15 09:02，之后没有成功、失败或跳过记录；飞书机器人身份仍为 `bot`，状态为 `available=true`、`tokenStatus=ready`。Claude Code 配置也曾在重启后丢失，说明两个客户端都必须纳入持续自检，而不是只修复 Codex。
 
 OpenAI 官方文档说明，用户级 `notify` 会在 `agent-turn-complete` 时调用一个外部程序，并将事件作为单个 JSON 参数传入。当前配置只能指定一个命令，因此飞书通知需要与 Codex 自带通知共享这一入口。
 
 ## 目标
 
+- Claude Code 正常完成、失败或等待用户输入时，按现有规则可靠发送飞书卡片。
 - Codex 正常 Turn 完成后可靠发送飞书卡片。
 - 保留 Codex 自带的 `turn-ended` 通知行为。
 - 保留 `hooks.json` 作为支持本地 Hook 的客户端或会话的兼容入口。
 - 两条入口同时触发时只发送一条飞书消息。
 - Windows 登录后自动检查并恢复配置，避免重启后再次失效。
-- Claude Code 现有 `Stop`、`StopFailure` 和 `Notification` 行为不变。
+- Claude Code 与 Codex 使用同一套卡片构造、发送、日志脱敏和幂等基础设施。
 - 安装、登录自检和测试都不主动发送飞书消息。
 
 ## 方案
+
+Claude Code 继续使用其官方生命周期 Hook，不增加旁路监听器：
+
+- `Stop`：会话正常结束。
+- `StopFailure`：会话失败结束。
+- `Notification`：只匹配 `permission_prompt|idle_prompt|agent_needs_input`。
+
+`Initialize-LarkNotify.ps1` 按现有安全合并规则持续确保这三个 Hook 存在、参数正确且各只有一个发送路径。若 Claude Code 启动、升级或其他工具覆盖 `settings.json`，周期 bootstrap 会恢复缺失 Hook；未知 Hook、permissions、plugins、env 与其他配置保持不变。
 
 新增 `hooks/Invoke-CodexNotifyBridge.ps1`，作为 `config.toml` 的唯一 `notify` 命令。它接收 Codex 追加的单个 `agent-turn-complete` JSON 参数，并执行两个彼此隔离的输出分支：
 
@@ -96,9 +107,9 @@ PowerShell 没有内置 TOML 写入 API，因此这里只实现受限的顶层 `
 
 ## 登录自恢复
 
-现有 `LarkNotifyBootstrap` 计划任务继续在当前用户登录时运行 `Initialize-LarkNotify.ps1`。引导脚本新增 `config.toml` 和原生通知命令检查，因此登录后会同时修复 Claude Hook、Codex Hook 与 Codex `notify` 桥接配置。
+现有 `LarkNotifyBootstrap` 计划任务继续在当前用户登录时运行 `Initialize-LarkNotify.ps1`。登录后会同时修复 Claude Code 的三个 Hook、Codex Hook 与 Codex `notify` 桥接配置。
 
-为消除“任务先运行、Codex 后启动并覆盖配置”的竞态，同一任务使用两个触发器：用户登录时立即检查，以及每天开始后每 10 分钟重复一次的轻量自检。每次脚本通常只读并在配置健康时立即退出，不常驻。若 Codex 在登录后或升级后把 `notify` 改回原生命令，最迟 10 分钟内会再次捕获原生命令并恢复桥接。登录触发仍保留失败重试。
+为消除“任务先运行、客户端后启动并覆盖配置”的竞态，同一任务使用两个触发器：用户登录时立即检查，以及每天开始后每 10 分钟重复一次的轻量自检。每次脚本通常只读并在配置健康时立即退出，不常驻。若 Claude Code 删除 Hook，或 Codex 把 `notify` 改回原生命令，最迟 10 分钟内会自动恢复。登录触发仍保留失败重试。
 
 计划任务不发送测试消息。配置正确时不重写任何文件；只有缺失、被 Codex 更新覆盖或原生运行时路径发生变化时才修复。任务仍以普通用户、隐藏窗口运行。配置更改对新 Turn 是否热加载由 Codex 客户端决定；bootstrap 在日志中记录“已修复，当前已运行会话若未热加载则下次启动生效”，但不自动终止或重启 Codex。
 
@@ -118,12 +129,13 @@ PowerShell 没有内置 TOML 写入 API，因此这里只实现受限的顶层 `
 - `-CheckOnly` 报告状态但不写文件。
 - bootstrap 成功后配置被 Codex 再次覆盖时，周期触发能重新捕获并恢复；日志不包含负载正文或敏感信息。
 - 未持久化内部 Turn 被跳过；索引延迟但在有界重试中出现时正常发送。
-- Claude Code 配置与通知行为保持不变。
+- Claude Code 三类 Hook 缺失、参数漂移、重复和被启动后再次删除时，bootstrap 能恢复为一个发送路径；未知配置保持不变。
+- Claude Code `Stop`、`StopFailure`、三种允许的 `Notification` 和其他被过滤的 `Notification` 使用隔离负载验证，且不访问飞书网络。
 
 ## 验收
 
 1. 运行全部通知脚本与 bootstrap 自动化测试。
-2. 运行 `Initialize-LarkNotify.ps1`，确认 `Healthy=true`，Codex `notify` 指向桥接器，原生命令已保存。
+2. 运行 `Initialize-LarkNotify.ps1`，确认 `Healthy=true`，Claude Code 三类 Hook 完整，Codex `notify` 指向桥接器，原生命令已保存。
 3. 再次使用 `-CheckOnly`，确认不需要变更。
 4. 查询 `LarkNotifyBootstrap`，确认任务启用、状态正常、最近结果为 0。
 5. 不手工发送测试卡片；由下一次正常结束的 Codex 或 Claude Code Turn 验证真实通知。
