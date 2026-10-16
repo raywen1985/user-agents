@@ -13,16 +13,35 @@ function parseResult(stdout) {
 }
 
 export class ClaudeExecutor {
-  constructor({ executable, model, timeoutMs, summaryLength = 500 }) {
+  constructor({ executable, model, timeoutMs, summaryLength = 500, beforeRun = null, beforeResume = null, runProcessImpl = runProcess }) {
     this.executable = executable;
     this.model = model;
     this.timeoutMs = timeoutMs;
     this.summaryLength = summaryLength;
+    this.beforeRun = beforeRun;
+    this.beforeResume = beforeResume;
+    this.runProcess = runProcessImpl;
   }
 
   async run({ session, content, signal, onNativeId }) {
+    if (this.beforeRun) {
+      const guarded = await this.beforeRun(session);
+      if (!guarded?.ok) {
+        const error = new Error("无法安全验证项目目录。");
+        error.code = guarded?.reason || "project_unverified";
+        throw error;
+      }
+    }
     const nativeId = session.native_id || randomUUID();
     onNativeId?.(nativeId);
+    if (session.native_id && this.beforeResume) {
+      const guarded = await this.beforeResume(session);
+      if (!guarded?.ok) {
+        const error = new Error(guarded?.reason === "busy" ? "原生 Claude Session 正在使用中。" : "无法安全验证原生 Claude Session。");
+        error.code = guarded?.reason || "snapshot_incomplete";
+        throw error;
+      }
+    }
     const args = [
       "-p", content,
       "--output-format", "json",
@@ -38,7 +57,7 @@ export class ClaudeExecutor {
     if (session.native_id) args.push("--resume", nativeId);
     else args.push("--session-id", nativeId);
 
-    const result = await runProcess(this.executable, args, {
+    const result = await this.runProcess(this.executable, args, {
       cwd: session.project_path,
       env: loadClaudeEnvironment(),
       timeoutMs: this.timeoutMs,

@@ -22,6 +22,55 @@ function collect() {
   try {
     validateColumns(history, "thread_turns", REQUIRED_TURN_COLUMNS);
     validateColumns(state, "threads", REQUIRED_THREAD_COLUMNS);
+    if (workerData.mode === "catalog") {
+      const latestTurn = history.prepare(`
+        SELECT thread_id, turn_id, status, started_at, rollout_ordinal
+        FROM thread_turns
+        WHERE thread_id=?
+        ORDER BY rollout_ordinal DESC, COALESCE(started_at, 0) DESC, turn_id ASC
+        LIMIT 1
+      `);
+      const metadata = state.prepare("SELECT name, cwd, updated_at_ms FROM threads WHERE id=?");
+      const records = [];
+      for (const entry of workerData.indexEntries || []) {
+        const meta = metadata.get(entry.id);
+        if (!meta) continue;
+        const turn = latestTurn.get(entry.id) || null;
+        records.push({
+          provider: "codex",
+          executor: "codex",
+          nativeId: entry.id,
+          sessionId: entry.id,
+          name: entry.name || meta.name || null,
+          aliases: meta.name && meta.name !== entry.name ? [meta.name] : [],
+          cwd: typeof meta.cwd === "string" && meta.cwd.startsWith("\\\\?\\") ? meta.cwd.slice(4) : meta.cwd || null,
+          updatedAt: Math.max(Number(entry.updatedAt || 0), Number(meta.updated_at_ms || 0), Number(turn?.started_at || 0) * 1000) || null,
+          latestTurn: turn ? {
+            turnId: turn.turn_id,
+            status: turn.status,
+            startedAt: turn.started_at,
+            rolloutOrdinal: turn.rollout_ordinal,
+          } : null,
+        });
+      }
+      return { records };
+    }
+    if (workerData.threadId) {
+      const row = history.prepare(`
+        SELECT thread_id, turn_id, status, started_at, rollout_ordinal
+        FROM thread_turns
+        WHERE thread_id=?
+        ORDER BY rollout_ordinal DESC, COALESCE(started_at, 0) DESC, turn_id ASC
+        LIMIT 1
+      `).get(workerData.threadId);
+      return { exact: row ? {
+        threadId: row.thread_id,
+        turnId: row.turn_id,
+        status: row.status,
+        startedAt: row.started_at,
+        rolloutOrdinal: row.rollout_ordinal,
+      } : null };
+    }
     const candidates = history.prepare(`
       WITH ranked AS (
         SELECT thread_id, turn_id, status, started_at, rollout_ordinal,
@@ -45,6 +94,7 @@ function collect() {
         agent: "codex",
         sessionId: row.thread_id,
         nativeId: row.thread_id,
+        turnId: row.turn_id,
         name: meta.name || null,
         status: "running",
         cwd: typeof meta.cwd === "string" && meta.cwd.startsWith("\\\\?\\") ? meta.cwd.slice(4) : meta.cwd || null,

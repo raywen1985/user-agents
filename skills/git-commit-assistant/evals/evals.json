@@ -4,11 +4,12 @@
     {
       "id": 1,
       "prompt": "帮我整理这个 Unity 项目的 C#、Lua、XML 改动，拆分后用 TortoiseGit 提交。",
-      "expected_output": "Uses the deterministic toolkit, preserves the index, normalizes only proven-safe noise, proposes file-level groups, and opens only one exact TortoiseGit group after safety checks.",
+      "expected_output": "Uses fast deterministic analysis, preserves the original diff and index by default, proposes file-level groups, and opens only one exact TortoiseGit group after safety checks.",
       "files": [],
       "expectations": [
         "Runs the bundled CommitToolkit.ps1 instead of loading the complete repository diff into model context.",
         "Preserves the Git index and does not run git commit or git push.",
+        "Reports normalization: disabled (default) and does not invoke or recommend Normalize.",
         "Creates defensible file-level commit groups without splitting a file by hunk.",
         "Uses recent repository history to propose messages and hands off only one group through an exact TortoiseGit dry-run."
       ]
@@ -35,6 +36,18 @@
         "Recognizes pending-confirmation state and does not infer cancellation from unchanged HEAD.",
         "Does not launch another TortoiseGit window without explicit cancellation confirmation.",
         "Reports the exact safe next action without committing or pushing."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "帮我按这个仓库最近的提交风格拆分并准备当前改动，保留原始 diff，不要清理空行或换行符。",
+      "expected_output": "Skips normalization by explicit user request, leaves all worktree bytes unchanged, uses bounded fast analysis, and continues through grouping and exact TortoiseGit handoff.",
+      "files": [],
+      "expectations": [
+        "Reports normalization: disabled (user requested) and never invokes Normalize.",
+        "Preserves the original worktree bytes and Git index.",
+        "Uses Analyze metadata without requesting or emitting raw patch text.",
+        "Continues through repository-style grouping and an exact one-group TortoiseGit handoff without committing or pushing."
       ]
     }
   ]

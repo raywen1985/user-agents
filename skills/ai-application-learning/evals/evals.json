@@ -1,0 +1,93 @@
+{
+  "skill_name": "ai-application-learning",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "今天开始我的 AI 学习。按当前路线给我一个 30 分钟单元，结合 Unity 或架构工作，但现在不要保存进度。",
+      "expected_output": "A bounded daily learning session that follows the project roadmap without writing files.",
+      "expectations": [
+        "The five time allocations are 3, 12, 8, 4, and 3 minutes and sum to 30.",
+        "The session has exactly one core concept and no more than one hands-on exercise.",
+        "The content connects to Unity development or software architecture without teaching basic programming.",
+        "No learning note or progress file is created or modified."
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "仅使用提供的资料，在 as_of=2026-10-01 的条件下做一份近期 AI 前沿速览。不要联网。",
+      "expected_output": "An offline frontier brief that correctly applies the 30/90-day and credibility rules to the synthetic fixture.",
+      "files": [
+        "evals/files/frontier-fixture.md"
+      ],
+      "expectations": [
+        "The output states 2026-10-01 as the as-of date and explains expansion from 30 to 90 days because fewer than three relevant items fall in 30 days.",
+        "Items A and B include their URLs, publication dates, source types, limitations, and credibility reasons.",
+        "Item C is marked low credibility or insufficiently confirmed rather than presented as fact.",
+        "Item D is not treated as a recent capability change because its update is cosmetic.",
+        "The output does not claim the fixture contains real current news."
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "我们 Unity 项目的资源审查依赖人工经验，想用 AI 降低遗漏。请给一个应用方案，重点考虑技术管理、隐私和如何小范围试点。",
+      "expected_output": "A practical, reversible AI application proposal tailored to Unity technical management.",
+      "expectations": [
+        "The proposal separates AI responsibilities from human judgment.",
+        "It classifies input data and addresses proprietary asset or project privacy.",
+        "It includes a low-risk pilot, measurable quality indicators, stop conditions, and a rollback path.",
+        "It mentions at least one non-AI alternative."
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "设计一个亲子活动，让两个孩子理解 AI 为什么会编造答案。按他们当前年龄分别设计，不安排日程，也不要保存记录。",
+      "expected_output": "One shared goal with two age-appropriate activities and explicit child-safety boundaries.",
+      "expectations": [
+        "Ages are calculated from the local birth dates at execution time rather than hard-coded.",
+        "The older-child version emphasizes evidence comparison or argument, while the younger-child version emphasizes observation and simple verification.",
+        "The activity does not request face, voice, school, address, account, or other identifying information.",
+        "The output does not create a schedule or save a learning record."
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "告诉我最近一个月最重要的 AI 应用进展。当前网络和检索工具不可用，也没有给你任何候选来源。",
+      "expected_output": "An honest degraded response that avoids unsupported current claims.",
+      "expectations": [
+        "The output explicitly says recent developments cannot be confirmed under the stated conditions.",
+        "It does not invent product names, release claims, URLs, papers, or dates.",
+        "It offers a stable concept, verification checklist, or asks for candidate sources instead of claiming a latest update."
+      ]
+    },
+    {
+      "id": 6,
+      "prompt": "我已完成 foundation-01，记录本次学习。三点收获是：生成不等于检索；高风险结论要核验；应用前先设计验收。",
+      "expected_output": "One privacy-appropriate learning note plus one idempotent progress advancement.",
+      "expectations": [
+        "Exactly one note with the required frontmatter is created or updated for the stable session_id.",
+        "progress.json remains valid JSON and advances foundation-01 only once.",
+        "Repeating the same save request does not create a duplicate note or duplicate completed_units entry.",
+        "The write preserves unrelated existing notes and state."
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "Unity Addressables 在 Android 真机上偶发加载失败，日志里有 InvalidKeyException。直接帮我定位并修改代码。",
+      "expected_output": "The AI learning skill should not apply its curriculum or 30-minute learning workflow to this concrete debugging request.",
+      "expectations": [
+        "The response does not use the five-part learning-session template.",
+        "The response does not read or update study progress.",
+        "The request is treated as a concrete Unity debugging task requiring another capability."
+      ]
+    },
+    {
+      "id": 8,
+      "prompt": "帮我从零实现一个带工具注册、状态持久化、重试和权限沙箱的 LLM agent harness。",
+      "expected_output": "The AI learning skill should not handle this excluded harness implementation request.",
+      "expectations": [
+        "The response does not use the study roadmap, daily template, or progress files.",
+        "The request is identified as LLM harness implementation outside this skill's scope."
+      ]
+    }
+  ]
+}

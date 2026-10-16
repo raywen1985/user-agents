@@ -1,0 +1,82 @@
+[
+  {
+    "query": "我每天只有半小时，今天沿着之前的路线继续学 AI，最好用 Unity 项目的例子。",
+    "should_trigger": true
+  },
+  {
+    "query": "RAG 到底解决什么问题？我做了很多年架构，不需要基础编程科普，重点讲边界和失败模式。",
+    "should_trigger": true
+  },
+  {
+    "query": "整理截至今天最近 30 天真正值得工程负责人关注的 AI 应用进展，给原始来源和日期，不要营销新闻。",
+    "should_trigger": true
+  },
+  {
+    "query": "我们是 Unity 团队，想试试 AI 做资源规范检查。帮我设计一个低风险试点以及怎么判断是否值得推广。",
+    "should_trigger": true
+  },
+  {
+    "query": "给两个孩子做一个理解 AI 幻觉的家庭活动，按年龄区分难度，不安排固定时间。",
+    "should_trigger": true
+  },
+  {
+    "query": "这个新发布的多模态模型对游戏研发到底有什么实际价值？请区分厂商说法和已经证实的能力。",
+    "should_trigger": true
+  },
+  {
+    "query": "我想系统补齐 Agent 的使用和治理知识，但不想做 harness 开发，给我下一阶段学习方向。",
+    "should_trigger": true
+  },
+  {
+    "query": "把 AI 引入技术方案评审应该注意什么？请结合架构决策、人机分工和验证方式。",
+    "should_trigger": true
+  },
+  {
+    "query": "我学完今天的 foundation 单元了，帮我保存三条收获并推进学习进度。",
+    "should_trigger": true
+  },
+  {
+    "query": "AI 在家庭旅行规划中怎样用才靠谱？尤其想知道信息时效和隐私边界。",
+    "should_trigger": true
+  },
+  {
+    "query": "Addressables 在 Android 上抛 InvalidKeyException，直接检查这段 C# 并给补丁。",
+    "should_trigger": false
+  },
+  {
+    "query": "给这个 Unity Shader 加一个 dissolve 效果，并写对应的自定义 Inspector。",
+    "should_trigger": false
+  },
+  {
+    "query": "设计并实现一个 LLM agent harness，要有 tool registry、memory、重试和权限沙箱。",
+    "should_trigger": false
+  },
+  {
+    "query": "我准备训练一个 70B 模型，帮我规划 GPU 集群、并行策略和推理服务。",
+    "should_trigger": false
+  },
+  {
+    "query": "把这篇 AI 新闻翻译成中文，保持原来的段落格式。",
+    "should_trigger": false
+  },
+  {
+    "query": "查一下今天科技板块有哪些公司上涨，重点看 AI 概念股。",
+    "should_trigger": false
+  },
+  {
+    "query": "把下面会议纪要整理成决策项和负责人，不需要学习材料。",
+    "should_trigger": false
+  },
+  {
+    "query": "帮我写一份给学校的请假邮件，孩子明天看牙。",
+    "should_trigger": false
+  },
+  {
+    "query": "审查这个架构 PR 有没有并发 bug 和兼容性回归。",
+    "should_trigger": false
+  },
+  {
+    "query": "用 OpenAI Responses API 写一个最小 Python 示例，直接给可运行代码。",
+    "should_trigger": false
+  }
+]

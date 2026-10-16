@@ -104,6 +104,11 @@ export function aggregateActiveAgentRecords(records, limit = 200) {
     const native = nativeGroup[0];
     nativeGroups.delete(key);
     const gatewayIds = [...new Set(group.map((item) => item.gatewayId || item.sessionId).filter(Boolean))].sort(ordinal);
+    const gatewayOwners = gatewayIds.map((gatewayId) => ({
+      gatewayId,
+      taskIds: [...new Set(group.filter((item) => (item.gatewayId || item.sessionId) === gatewayId)
+        .map((item) => item.taskId).filter(Boolean))].sort(ordinal),
+    }));
     merged.push({
       ...(native || {}),
       ...gateway,
@@ -113,6 +118,7 @@ export function aggregateActiveAgentRecords(records, limit = 200) {
       updatedAt: Math.max(Number(gateway.updatedAt || 0), Number(native?.updatedAt || 0)) || null,
       gatewayIds: gatewayIds.slice(0, 3),
       extraGatewayIds: Math.max(0, gatewayIds.length - 3),
+      gatewayOwners,
     });
   }
 
@@ -140,7 +146,9 @@ export function formatActiveAgentSessions(records, warnings = [], options = {}) 
     const location = compactOneLine(record.projectAlias || record.cwd || "未知目录", 180);
     const pid = record.pid ? ` | PID ${record.pid}` : "";
     const extra = record.extraGatewayIds ? ` | +${record.extraGatewayIds} gateway IDs` : "";
-    return `${displayAgent(record)} | ${record.status} | ${name} | ${primaryId} | ${location}${pid}${extra}`;
+    const stop = record.stopRef ? ` | 停止ID: ${record.stopRef}`
+      : record.stopCapability?.reason ? ` | 停止: 不可用 (${record.stopCapability.reason})` : "";
+    return `${displayAgent(record)} | ${record.status} | ${name} | ${primaryId} | ${location}${pid}${extra}${stop}`;
   });
   const hidden = Math.max(0, records.length - shown.length) + Number(options.additionalHidden || 0);
   if (hidden) lines.push(`... 另有 ${hidden} 个活跃 Session 未显示`);
@@ -205,6 +213,14 @@ export async function collectCodexCandidates({ codexRoot, timeoutMs = 4000, Work
     return [{ ...record, nativeId, sessionId: nativeId, lockPath: path.join(codexRoot, "thread-writer-locks", `${nativeId}.lock`) }];
   });
   return { records, truncated: Boolean(result.truncated) };
+}
+
+export async function collectCodexExact({ codexRoot, threadId, timeoutMs = 2000, WorkerImpl = Worker }) {
+  const history = await highestDatabase(codexRoot, "thread_history");
+  const state = await highestDatabase(codexRoot, "state");
+  if (!history || !state) throw new Error("Codex session databases were not found");
+  const result = await runCodexWorker({ historyPath: history.filePath, statePath: state.filePath, threadId }, timeoutMs, WorkerImpl);
+  return result.exact || null;
 }
 
 function normalizedClaudeStatus(value) {
@@ -273,6 +289,28 @@ export async function collectClaudeCandidates({ claudeRoot, signal }) {
   };
 }
 
+export async function readExactClaudeSession({ claudeRoot, sourcePath, sessionId, pid, procStart }) {
+  const sourceStat = await fsp.lstat(sourcePath);
+  if (sourceStat.isSymbolicLink()) return { ok: false, reason: "identity_changed" };
+  const sessionsRoot = await fsp.realpath(path.join(claudeRoot, "sessions"));
+  const canonical = await fsp.realpath(sourcePath);
+  const relative = path.relative(sessionsRoot, canonical);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return { ok: false, reason: "identity_changed" };
+  const stat = await fsp.lstat(canonical);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 65536) return { ok: false, reason: "identity_changed" };
+  let payload;
+  try { payload = JSON.parse(await fsp.readFile(canonical, "utf8")); } catch { return { ok: false, reason: "snapshot_incomplete" }; }
+  const state = normalizedClaudeStatus(payload.status);
+  if (normalizeId(payload.sessionId) !== normalizeId(sessionId)
+    || Number(payload.pid) !== Number(pid) || String(payload.procStart || "") !== String(procStart || "")) {
+    return { ok: false, reason: "identity_changed" };
+  }
+  if (!state || TERMINAL_CLAUDE_STATES.has(state)) return { ok: false, reason: "already_finished" };
+  return { ok: true, record: {
+    sessionId: normalizeId(sessionId), pid: Number(pid), procStart: String(procStart), sourcePath: canonical, status: state,
+  } };
+}
+
 function validateProbeResults(requests, results, label) {
   if (!Array.isArray(results) || results.length !== requests.length) throw new Error(`${label} probe result count mismatch`);
   const expected = new Set(requests.map((item) => item.id));
@@ -311,7 +349,7 @@ function boundedWarning(provider, error) {
   return `${provider}：${compactOneLine(error?.message || error || "查询失败", 180)}`;
 }
 
-export async function listActiveAgentSessions({
+export async function collectActiveAgentSessionRecords({
   gatewayActivities = [],
   gatewayTruncated = false,
   codexRoot = path.join(os.homedir(), ".codex"),
@@ -320,17 +358,19 @@ export async function listActiveAgentSessions({
   collectClaude = collectClaudeCandidates,
   probe = runWindowsSessionProbe,
   totalTimeoutMs = 5000,
+  aggregateLimit = 200,
+  executor = null,
 } = {}) {
   const started = Date.now();
   const warnings = [];
   const claudeAbort = new AbortController();
   const providerTimeout = Math.min(4000, totalTimeoutMs);
   const [codexResult, claudeResult] = await Promise.allSettled([
-    withTimeout(
+    executor === "claude" ? Promise.resolve({ records: [], truncated: false }) : withTimeout(
       collectCodex({ codexRoot, timeoutMs: providerTimeout }),
       providerTimeout,
     ),
-    withTimeout(
+    executor === "codex" ? Promise.resolve({ records: [], truncated: false, skipped: 0 }) : withTimeout(
       collectClaude({ claudeRoot, signal: claudeAbort.signal }),
       providerTimeout,
       () => claudeAbort.abort(),
@@ -338,6 +378,11 @@ export async function listActiveAgentSessions({
   ]);
   let codex = codexResult.status === "fulfilled" ? codexResult.value : { records: [], truncated: false };
   let claude = claudeResult.status === "fulfilled" ? claudeResult.value : { records: [], truncated: false, skipped: 0 };
+  const completeness = {
+    gateway: !gatewayTruncated,
+    codex: executor === "claude" || (codexResult.status === "fulfilled" && !codex.truncated),
+    claude: executor === "codex" || (claudeResult.status === "fulfilled" && !claude.truncated && !claude.skipped),
+  };
   if (codexResult.status === "rejected") warnings.push(boundedWarning("Codex", codexResult.reason));
   if (claudeResult.status === "rejected") warnings.push(boundedWarning("Claude", claudeResult.reason));
   if (codex.truncated) warnings.push("Codex：结果达到 200 条上限");
@@ -358,23 +403,36 @@ export async function listActiveAgentSessions({
       const claudeProbeError = [...probed.processes.values()].find((item) => ["accessDenied", "error"].includes(item.state));
       if (codexProbeError) {
         codex.records = [];
+        completeness.codex = false;
         warnings.push(`Codex：Windows 锁探针失败 (${codexProbeError.code ?? "unknown"})`);
       } else {
         codex.records = codex.records.filter((record) => probed.locks.get(record.nativeId)?.state === "held");
       }
       if (claudeProbeError) {
         claude.records = [];
+        completeness.claude = false;
         warnings.push(`Claude：Windows 进程探针失败 (${claudeProbeError.code ?? "unknown"})`);
       } else {
         claude.records = claude.records.filter((record) => probed.processes.get(record.nativeId)?.state === "live");
       }
     } catch (error) {
-      if (locks.length) { codex.records = []; warnings.push(boundedWarning("Codex", error)); }
-      if (processes.length) { claude.records = []; warnings.push(boundedWarning("Claude", error)); }
+      if (locks.length) { codex.records = []; completeness.codex = false; warnings.push(boundedWarning("Codex", error)); }
+      if (processes.length) { claude.records = []; completeness.claude = false; warnings.push(boundedWarning("Claude", error)); }
     }
   }
   claudeAbort.abort();
 
-  const aggregate = aggregateActiveAgentRecords([...gatewayActivities, ...codex.records, ...claude.records]);
-  return formatActiveAgentSessions(aggregate.records, warnings, { additionalHidden: aggregate.truncated });
+  const aggregate = aggregateActiveAgentRecords([...gatewayActivities, ...codex.records, ...claude.records], aggregateLimit);
+  if (aggregate.truncated) {
+    completeness.gateway = false;
+    completeness.codex = false;
+    completeness.claude = false;
+  }
+  return { records: aggregate.records, warnings, additionalHidden: aggregate.truncated, completeness };
+}
+
+export async function listActiveAgentSessions(options = {}) {
+  const collected = await collectActiveAgentSessionRecords(options);
+  const records = options.decorateRecords ? await options.decorateRecords(collected.records) : collected.records;
+  return formatActiveAgentSessions(records, collected.warnings, { additionalHidden: collected.additionalHidden });
 }

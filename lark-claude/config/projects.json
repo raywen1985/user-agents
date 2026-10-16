@@ -1,4 +1,5 @@
 {
+  "excludedRoots": [],
   "projects": [
     {
       "alias": "unity_asset",

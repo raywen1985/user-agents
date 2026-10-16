@@ -1,6 +1,6 @@
 ---
 name: git-commit-assistant
-description: Prepare small, reviewable Git commits on Windows with conservative diff-noise cleanup, compact deterministic analysis, repository-style commit messages, local validation, and exact TortoiseGit file selection. Use whenever the user asks to clean noisy C#/Lua/XML/JSON or other text diffs, split working-tree changes into commits, follow recent commit style, continue a saved commit plan, or open a prefilled TortoiseGit commit window. Never commit or push automatically.
+description: Prepare small, reviewable Git commits on Windows with fast bounded analysis, optional conservative diff-noise cleanup, repository-style commit messages, local validation, and exact TortoiseGit file selection. Use whenever the user asks to clean noisy C#/Lua/XML/JSON or other text diffs, split working-tree changes into commits, preserve original diffs while preparing commits, follow recent commit style, continue a saved commit plan, or open a prefilled TortoiseGit commit window. Never commit or push automatically.
 compatibility: Windows PowerShell 5.1 or PowerShell 7, Git, and TortoiseGit for GUI launch.
 ---
 
@@ -48,24 +48,23 @@ Run:
 CommitToolkit.ps1 -Action Analyze -Repository <repo>
 ```
 
-Use the returned file metadata, directory rollups, recent commit subjects, and style features. Do not request or load a full repository patch. Expand only ambiguous files with narrowly scoped Git commands after secret scanning, normally with one line of context and a strict output bound.
+Use the returned file metadata, directory rollups, recent commit subjects, and style features. Do not request, load, or emit raw patch text during commit preparation. If a file remains ambiguous from the bounded manifest, mark it mixed and ask the user to reorganize it or identify its intent.
 
 If the tool reports staged changes, conflicts, an active history operation, detached HEAD, unsafe attributes, secrets, or a nested repository, stop and give the safe next action.
 
-### 3. Normalize proven noise
+### 3. Choose normalization mode
 
-Run `Normalize` once before grouping. First use `-DryRun` when the repository is unfamiliar or the change set is large.
+Normalization is disabled by default. Decide the mode from the user's current request without adding a clarification round trip:
 
-Report:
+- Explicit cleanup of whitespace, blank lines, EOLs, BOMs, encoding noise, or other invalid diff noise: `normalization: enabled (user requested)`.
+- Explicit preservation of the original diff or request to skip cleanup: `normalization: disabled (user requested)`.
+- Ordinary or ambiguous commit preparation: `normalization: disabled (default)`.
 
-- which files would change or changed;
-- the proof adapter used;
-- lines/hunks removed;
-- every skipped file and reason.
+When disabled, do not invoke or recommend `Normalize`; continue directly to grouping with the original worktree bytes.
 
-An extension is only inspection eligibility. It is not proof that rewriting is safe. Treat skipped ambiguous content as intentional protection, not as a failure to work around.
+When enabled, run `Normalize` before grouping. First use `-DryRun` when the repository is unfamiliar or the change set is large. Report which files would change or changed, the proof adapter, removed lines/hunks, and every skipped file with its reason. An extension is only inspection eligibility, not proof that rewriting is safe. Run `Analyze` again after a real normalization.
 
-Run `Analyze` again after a real normalization.
+Never run `Normalize` while a saved plan exists. Finish or explicitly clear that plan first.
 
 ### 4. Form file-level groups
 
@@ -137,10 +136,11 @@ On the next invocation, start again with `Status`, then `OpenNext`. The tool ver
 
 Keep reports compact:
 
-- normalization summary;
+- one exact normalization mode line;
+- proof and skip details only when normalization is enabled;
 - ordered groups with messages and file counts;
 - validation result or exact approval request;
 - current TortoiseGit group;
 - safe next action.
 
-Do not paste full diffs unless the user explicitly asks and secret scanning has already passed.
+Do not request or paste raw patches as part of this workflow. The toolkit's bounded manifest and later mandatory validation are the supported analysis channels.

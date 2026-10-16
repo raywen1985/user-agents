@@ -16,13 +16,16 @@ param(
 
     [string]$ValidationApprovalId,
     [switch]$ConfirmCancelled,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$InternalLoadOnly
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $script:SchemaVersion = 1
+$script:GitProcessCount = 0
+$script:InvocationStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $script:MaxTextBytes = 4MB
 $script:MaxNormalizeLines = 20000
 $script:MaxCommandLineUnits = 30000
@@ -245,7 +248,9 @@ function Invoke-Git {
         [string[]]$Arguments,
         [switch]$AllowFailure,
         [byte[]]$InputBytes,
-        [int]$TimeoutMilliseconds = 120000
+        [int]$TimeoutMilliseconds = 120000,
+        [hashtable]$Environment = @{},
+        [switch]$StrictWhitespace
     )
 
     $git = (Get-Command git.exe -ErrorAction SilentlyContinue)
@@ -256,11 +261,17 @@ function Invoke-Git {
         Throw-ToolkitError 'GIT_NOT_FOUND' 'Git was not found on PATH.'
     }
 
+    $whitespaceRules = if ($StrictWhitespace) {
+        'blank-at-eol,blank-at-eof,space-before-tab'
+    }
+    else {
+        'blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol'
+    }
     $safeArguments = @(
         '--no-optional-locks',
         '-c', 'core.fsmonitor=false',
         '-c', 'core.quotepath=false',
-        '-c', 'core.whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol',
+        '-c', "core.whitespace=$whitespaceRules",
         '-C', $Repo
     )
     if ($Arguments.Count -gt 0 -and $Arguments[0] -eq 'diff') {
@@ -273,7 +284,8 @@ function Invoke-Git {
         $safeArguments += $Arguments
     }
 
-    $result = Invoke-NativeBytes -FileName $git.Source -Arguments $safeArguments -WorkingDirectory $Repo -InputBytes $InputBytes -TimeoutMilliseconds $TimeoutMilliseconds
+    $script:GitProcessCount++
+    $result = Invoke-NativeBytes -FileName $git.Source -Arguments $safeArguments -WorkingDirectory $Repo -InputBytes $InputBytes -TimeoutMilliseconds $TimeoutMilliseconds -Environment $Environment
     if ($result.ExitCode -ne 0 -and -not $AllowFailure) {
         $message = $result.Stderr.Trim()
         if ([string]::IsNullOrEmpty($message)) {
@@ -342,10 +354,14 @@ function Get-IndexHash {
 }
 
 function Assert-IndexUnchanged {
-    param([object]$RepositoryInfo, [string]$BeforeHash)
+    param([object]$RepositoryInfo, [string]$BeforeHash, [string]$Stage = 'action')
     $afterHash = Get-IndexHash $RepositoryInfo
     if ($BeforeHash -ne $afterHash) {
-        Throw-ToolkitError 'INDEX_CHANGED' 'The Git index changed during a read-only toolkit action.'
+        Throw-ToolkitError 'INDEX_CHANGED' 'The Git index changed during a read-only toolkit action.' ([pscustomobject]@{
+            beforeSha256 = $BeforeHash
+            afterSha256 = $afterHash
+            stage = $Stage
+        })
     }
 }
 
@@ -401,18 +417,31 @@ function Get-OperationState {
     return @($active)
 }
 
-function Get-WorktreeStatus {
-    param([string]$Repo)
+function ConvertFrom-NulUtf8Fields {
+    param([byte[]]$Bytes)
 
-    $result = Invoke-Git -Repo $Repo -Arguments @('status', '--porcelain=v2', '-z', '--untracked-files=all')
-    $text = ConvertFrom-Utf8Bytes $result.StdoutBytes
-    $records = $text.Split([char]0)
+    if ($Bytes.Length -eq 0) { return @() }
+    $text = ConvertFrom-Utf8Bytes $Bytes
+    if ($text.Length -eq 0 -or $text[$text.Length - 1] -ne [char]0) {
+        Throw-ToolkitError 'BATCH_PARSE_FAILED' 'NUL-delimited Git output was not terminated.'
+    }
+    $parts = $text.Split([char]0)
+    return @($parts[0..($parts.Count - 2)])
+}
+
+function ConvertFrom-PorcelainV2Bytes {
+    param([byte[]]$Bytes, [string]$Repo)
+
+    $records = @(ConvertFrom-NulUtf8Fields $Bytes)
     $entries = New-Object System.Collections.ArrayList
+    $seenPaths = @{}
     $index = 0
     while ($index -lt $records.Length) {
         $record = $records[$index]
         $index++
-        if ([string]::IsNullOrEmpty($record)) { continue }
+        if ([string]::IsNullOrEmpty($record)) {
+            Throw-ToolkitError 'BATCH_PARSE_FAILED' 'Porcelain-v2 output contained an empty record.'
+        }
 
         $kind = $record.Substring(0, 1)
         $path = $null
@@ -422,33 +451,49 @@ function Get-WorktreeStatus {
         switch ($kind) {
             '1' {
                 $parts = $record -split ' ', 9
-                if ($parts.Count -lt 9) { Throw-ToolkitError 'STATUS_PARSE_FAILED' 'Could not parse a porcelain-v2 ordinary entry.' }
+                if ($parts.Count -ne 9) { Throw-ToolkitError 'BATCH_PARSE_FAILED' 'Could not parse a porcelain-v2 ordinary entry.' }
                 $xy = $parts[1]
                 $submodule = $parts[2] -ne 'N...'
                 $path = $parts[8]
             }
             '2' {
                 $parts = $record -split ' ', 10
-                if ($parts.Count -lt 10 -or $index -ge $records.Length) { Throw-ToolkitError 'STATUS_PARSE_FAILED' 'Could not parse a porcelain-v2 rename entry.' }
+                if ($parts.Count -ne 10 -or $index -ge $records.Length -or $parts[8] -notmatch '^R\d+$') {
+                    Throw-ToolkitError 'BATCH_PARSE_FAILED' 'Could not parse a porcelain-v2 rename entry.'
+                }
                 $xy = $parts[1]
                 $submodule = $parts[2] -ne 'N...'
                 $path = $parts[9]
                 $originalPath = $records[$index]
                 $index++
+                if ([string]::IsNullOrEmpty($originalPath)) {
+                    Throw-ToolkitError 'BATCH_PARSE_FAILED' 'Porcelain-v2 rename source was empty.'
+                }
             }
             'u' {
                 $parts = $record -split ' ', 11
-                if ($parts.Count -lt 11) { Throw-ToolkitError 'STATUS_PARSE_FAILED' 'Could not parse a porcelain-v2 conflict entry.' }
+                if ($parts.Count -ne 11) { Throw-ToolkitError 'BATCH_PARSE_FAILED' 'Could not parse a porcelain-v2 conflict entry.' }
                 $xy = $parts[1]
                 $path = $parts[10]
             }
             '?' {
                 $xy = '??'
+                if ($record.Length -lt 3 -or $record[1] -ne ' ') {
+                    Throw-ToolkitError 'BATCH_PARSE_FAILED' 'Could not parse a porcelain-v2 untracked entry.'
+                }
                 $path = $record.Substring(2)
             }
-            '!' { continue }
-            default { continue }
+            default { Throw-ToolkitError 'BATCH_PARSE_FAILED' "Unsupported porcelain-v2 record kind: $kind" }
         }
+
+        if ([string]::IsNullOrEmpty($path)) {
+            Throw-ToolkitError 'BATCH_PARSE_FAILED' 'Porcelain-v2 output contained an empty path.'
+        }
+        $path = $path.Replace('\', '/')
+        if ($seenPaths.ContainsKey($path)) {
+            Throw-ToolkitError 'BATCH_PARSE_FAILED' "Porcelain-v2 output contained a duplicate path: $path"
+        }
+        $seenPaths[$path] = $true
 
         $fullPath = [System.IO.Path]::GetFullPath((Join-Path $Repo ($path.Replace('/', '\'))))
         if (-not (Test-PathInsideRoot -Root $Repo -Path $fullPath)) {
@@ -459,7 +504,7 @@ function Get-WorktreeStatus {
         [void]$entries.Add([pscustomobject]@{
             kind = $kind
             status = $xy
-            path = $path.Replace('\', '/')
+            path = $path
             originalPath = if ($null -eq $originalPath) { $null } else { $originalPath.Replace('\', '/') }
             fullPath = $fullPath
             tracked = $kind -ne '?'
@@ -471,32 +516,175 @@ function Get-WorktreeStatus {
     return @($entries)
 }
 
-function Get-PathAttributes {
-    param([string]$Repo, [string]$Path)
-    $names = @('text', 'eol', 'working-tree-encoding', 'filter', 'ident', 'diff', 'linguist-generated', 'generated')
-    $arguments = @('check-attr', '-z') + $names + @('--', $Path)
-    $result = Invoke-Git -Repo $Repo -Arguments $arguments
-    $parts = (ConvertFrom-Utf8Bytes $result.StdoutBytes).Split([char]0)
-    $attributes = [ordered]@{}
-    for ($i = 0; $i + 2 -lt $parts.Length; $i += 3) {
-        if ([string]::IsNullOrEmpty($parts[$i])) { continue }
-        $attributes[$parts[$i + 1]] = $parts[$i + 2]
-    }
-    foreach ($name in $names) {
-        if (-not $attributes.Contains($name)) {
-            $attributes[$name] = 'unspecified'
-        }
-    }
-    return [pscustomobject]$attributes
+function Get-WorktreeStatus {
+    param([string]$Repo, [hashtable]$Environment = @{})
+    $result = Invoke-Git -Repo $Repo -Arguments @('-c', 'status.renames=true', 'status', '--porcelain=v2', '-z', '--untracked-files=all', '--find-renames=50%') -Environment $Environment
+    return @(ConvertFrom-PorcelainV2Bytes -Bytes $result.StdoutBytes -Repo $Repo)
 }
 
-function Test-ReparsePoint {
-    param([string]$Path)
-    if (-not [System.IO.File]::Exists($Path) -and -not [System.IO.Directory]::Exists($Path)) {
-        return $false
+function Get-StatusCandidatePaths {
+    param([string]$Repo, [hashtable]$Environment = @{})
+
+    $result = Invoke-Git -Repo $Repo -Arguments @(
+        'ls-files', '-z', '--deduplicate', '--modified', '--deleted', '--others', '--exclude-standard'
+    ) -Environment $Environment
+    $paths = New-Object System.Collections.ArrayList
+    $seen = @{}
+    foreach ($pathValue in @(ConvertFrom-NulUtf8Fields $result.StdoutBytes)) {
+        $path = ([string]$pathValue).Replace('\', '/')
+        if ([string]::IsNullOrEmpty($path) -or $seen.ContainsKey($path)) {
+            Throw-ToolkitError 'BATCH_PARSE_FAILED' 'Status candidate output contained an empty or duplicate path.'
+        }
+        $fullPath = [System.IO.Path]::GetFullPath((Join-Path $Repo ($path.Replace('/', '\'))))
+        if (-not (Test-PathInsideRoot -Root $Repo -Path $fullPath)) {
+            Throw-ToolkitError 'PATH_OUTSIDE_WORKTREE' "Git reported a status candidate outside the worktree: $path"
+        }
+        $seen[$path] = $true
+        [void]$paths.Add($path)
     }
-    $item = Get-Item -LiteralPath $Path -Force
-    return (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+    return @($paths)
+}
+
+function Get-AttributeNames {
+    return @('text', 'eol', 'working-tree-encoding', 'filter', 'ident', 'diff', 'linguist-generated', 'generated')
+}
+
+function ConvertFrom-AttributeBytes {
+    param([byte[]]$Bytes, [string[]]$Paths, [string[]]$Names)
+
+    $requested = @{}
+    $pathCount = 0
+    foreach ($path in $Paths) {
+        $pathCount++
+        if ([string]::IsNullOrEmpty($path) -or $requested.ContainsKey($path)) {
+            Throw-ToolkitError 'BATCH_PARSE_FAILED' 'The attribute request contained an empty or duplicate path.'
+        }
+        $requested[$path] = [ordered]@{}
+    }
+    if ($pathCount -eq 0) { return @{} }
+
+    $fields = @(ConvertFrom-NulUtf8Fields $Bytes)
+    if (($fields.Count % 3) -ne 0) {
+        Throw-ToolkitError 'BATCH_PARSE_FAILED' 'Attribute output contained a truncated record.'
+    }
+    $allowedNames = @{}
+    foreach ($name in $Names) { $allowedNames[$name] = $true }
+    for ($i = 0; $i -lt $fields.Count; $i += 3) {
+        $path = [string]$fields[$i]
+        $name = [string]$fields[$i + 1]
+        $value = [string]$fields[$i + 2]
+        if (-not $requested.ContainsKey($path) -or -not $allowedNames.ContainsKey($name) -or [string]::IsNullOrEmpty($value)) {
+            Throw-ToolkitError 'BATCH_PARSE_FAILED' 'Attribute output contained an unexpected path, name, or empty value.' ([pscustomobject]@{
+                path = $path
+                name = $name
+                pathRequested = $requested.ContainsKey($path)
+                nameRequested = $allowedNames.ContainsKey($name)
+                valueEmpty = [string]::IsNullOrEmpty($value)
+            })
+        }
+        if ($requested[$path].Contains($name)) {
+            Throw-ToolkitError 'BATCH_PARSE_FAILED' "Attribute output contained a duplicate value for $path ($name)."
+        }
+        $requested[$path][$name] = $value
+    }
+    $result = @{}
+    foreach ($path in $Paths) {
+        foreach ($name in $Names) {
+            if (-not $requested[$path].Contains($name)) {
+                Throw-ToolkitError 'BATCH_PARSE_FAILED' "Attribute output omitted $name for $path."
+            }
+        }
+        $result[$path] = [pscustomobject]$requested[$path]
+    }
+    return $result
+}
+
+function Get-PathAttributesBulk {
+    param([string]$Repo, [string[]]$Paths)
+    $pathCount = 0
+    foreach ($path in $Paths) { $pathCount++ }
+    if ($pathCount -eq 0) { return @{} }
+    $names = @(Get-AttributeNames)
+    $input = $script:Utf8NoBom.GetBytes((($Paths -join [char]0) + [char]0))
+    $arguments = @('check-attr', '-z', '--stdin') + $names
+    $result = Invoke-Git -Repo $Repo -Arguments $arguments -InputBytes $input
+    return ConvertFrom-AttributeBytes -Bytes $result.StdoutBytes -Paths $Paths -Names $names
+}
+
+function Get-FilterNeutralizationEnvironment {
+    param([hashtable]$AttributesByPath)
+
+    $drivers = @{}
+    foreach ($attributes in $AttributesByPath.Values) {
+        $driver = [string]$attributes.filter
+        if ($driver -notin @('unspecified', 'unset', '')) {
+            $drivers[$driver] = $true
+        }
+    }
+    if ($drivers.Count -eq 0) { return @{} }
+
+    # Git status may run clean/process filters while comparing the worktree. Empty
+    # command overrides make candidate discovery metadata-only for filtered paths.
+    $pairs = New-Object System.Collections.ArrayList
+    $settings = [ordered]@{
+        process = ''
+        clean = ''
+        smudge = ''
+        required = 'false'
+    }
+    foreach ($driver in @($drivers.Keys | Sort-Object)) {
+        foreach ($setting in $settings.GetEnumerator()) {
+            [void]$pairs.Add([pscustomobject]@{
+                key = "filter.$driver.$($setting.Key)"
+                value = [string]$setting.Value
+            })
+        }
+    }
+
+    $environment = @{ GIT_CONFIG_COUNT = [string]$pairs.Count }
+    for ($index = 0; $index -lt $pairs.Count; $index++) {
+        $environment["GIT_CONFIG_KEY_$index"] = $pairs[$index].key
+        $environment["GIT_CONFIG_VALUE_$index"] = $pairs[$index].value
+    }
+    return $environment
+}
+
+function Get-ReparseBlock {
+    param([string]$Root, [string]$FullPath)
+
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    $pathFull = [System.IO.Path]::GetFullPath($FullPath)
+    if (-not (Test-PathInsideRoot -Root $rootFull -Path $pathFull)) {
+        Throw-ToolkitError 'PATH_OUTSIDE_WORKTREE' "Path escaped the worktree: $pathFull"
+    }
+    try {
+        $rootAttributes = [System.IO.File]::GetAttributes($rootFull)
+    }
+    catch {
+        Throw-ToolkitError 'UNSAFE_PATH' "Could not inspect repository root metadata: $rootFull"
+    }
+    if (($rootAttributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return $rootFull
+    }
+
+    $relative = $pathFull.Substring($rootFull.Length).TrimStart('\', '/')
+    $segments = $relative.Split([char[]]@('\', '/'), [System.StringSplitOptions]::RemoveEmptyEntries)
+    $current = $rootFull
+    foreach ($segment in $segments) {
+        $current = Join-Path $current $segment
+        try {
+            $attributes = [System.IO.File]::GetAttributes($current)
+        }
+        catch [System.IO.FileNotFoundException] { return $null }
+        catch [System.IO.DirectoryNotFoundException] { return $null }
+        catch {
+            Throw-ToolkitError 'UNSAFE_PATH' "Could not inspect path metadata without opening content: $current"
+        }
+        if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $current
+        }
+    }
+    return $null
 }
 
 function Test-BinaryBytes {
@@ -549,45 +737,89 @@ function Get-SecretFindings {
     return @($findings)
 }
 
-function Get-ChangeStats {
-    param([string]$Repo, [object]$Entry, [long]$Size)
+function ConvertFrom-NumstatBytes {
+    param([byte[]]$Bytes, [object[]]$Entries)
 
-    if (-not $Entry.tracked -or $Entry.status -match 'D') {
-        return [pscustomobject]@{
-            added = if ($Entry.tracked) { 0 } else { $null }
-            deleted = 0
-            hunks = $null
-            whitespaceOnly = $false
+    $allowed = @{}
+    $ignoredRenameParts = @{}
+    foreach ($entry in $Entries) {
+        if (-not [string]::IsNullOrEmpty([string]$entry.originalPath)) {
+            $ignoredRenameParts[[string]$entry.path] = $true
+            $ignoredRenameParts[[string]$entry.originalPath] = $true
+        }
+        else {
+            $allowed[[string]$entry.path] = $true
         }
     }
 
-    $numstat = Invoke-Git -Repo $Repo -Arguments @('diff', '--numstat', '-z', '--', $Entry.path) -AllowFailure
-    $added = $null
-    $deleted = $null
-    if ($numstat.ExitCode -eq 0) {
-        $raw = ConvertFrom-Utf8Bytes $numstat.StdoutBytes
-        $first = ($raw.Split([char]0) | Select-Object -First 1)
-        if ($first -match '^([^\t]+)\t([^\t]+)\t') {
-            if ($matches[1] -ne '-') { $added = [int]$matches[1] }
-            if ($matches[2] -ne '-') { $deleted = [int]$matches[2] }
+    $result = @{}
+    foreach ($record in @(ConvertFrom-NulUtf8Fields $Bytes)) {
+        if ($record -notmatch '^([^\t]+)\t([^\t]+)\t(.+)$') {
+            Throw-ToolkitError 'BATCH_PARSE_FAILED' 'Numstat output contained a malformed record.'
+        }
+        $addedText = $matches[1]
+        $deletedText = $matches[2]
+        $path = $matches[3].Replace('\', '/')
+        if ($ignoredRenameParts.ContainsKey($path)) { continue }
+        if (-not $allowed.ContainsKey($path) -or $result.ContainsKey($path)) {
+            Throw-ToolkitError 'BATCH_PARSE_FAILED' "Numstat output contained an unexpected or duplicate path: $path"
+        }
+        $binary = $addedText -eq '-' -and $deletedText -eq '-'
+        if (-not $binary -and ($addedText -notmatch '^\d+$' -or $deletedText -notmatch '^\d+$')) {
+            Throw-ToolkitError 'BATCH_PARSE_FAILED' "Numstat output contained invalid counts for $path."
+        }
+        $result[$path] = [pscustomobject]@{
+            added = if ($binary) { $null } else { [int64]$addedText }
+            deleted = if ($binary) { $null } else { [int64]$deletedText }
+            binary = $binary
         }
     }
+    return $result
+}
 
-    $hunks = $null
-    if ($Size -le 1MB) {
-        $patch = Invoke-Git -Repo $Repo -Arguments @('diff', '--unified=0', '--', $Entry.path) -AllowFailure
-        if ($patch.ExitCode -eq 0 -and $patch.StdoutBytes.Length -le 2MB) {
-            $patchText = ConvertFrom-Utf8Bytes $patch.StdoutBytes
-            $hunks = ([regex]::Matches($patchText, '(?m)^@@ ')).Count
+function ConvertFrom-NulPathSet {
+    param([byte[]]$Bytes, [object[]]$Entries)
+
+    $allowed = @{}
+    $ignoredRenameParts = @{}
+    foreach ($entry in $Entries) {
+        if (-not [string]::IsNullOrEmpty([string]$entry.originalPath)) {
+            $ignoredRenameParts[[string]$entry.path] = $true
+            $ignoredRenameParts[[string]$entry.originalPath] = $true
+        }
+        else {
+            $allowed[[string]$entry.path] = $true
         }
     }
+    $result = @{}
+    foreach ($pathValue in @(ConvertFrom-NulUtf8Fields $Bytes)) {
+        $path = ([string]$pathValue).Replace('\', '/')
+        if ([string]::IsNullOrEmpty($path)) {
+            Throw-ToolkitError 'BATCH_PARSE_FAILED' 'The path set contained an empty path.'
+        }
+        if ($ignoredRenameParts.ContainsKey($path)) { continue }
+        if (-not $allowed.ContainsKey($path) -or $result.ContainsKey($path)) {
+            Throw-ToolkitError 'BATCH_PARSE_FAILED' "The path set contained an unexpected or duplicate path: $path"
+        }
+        $result[$path] = $true
+    }
+    return $result
+}
 
-    $whitespace = Invoke-Git -Repo $Repo -Arguments @('diff', '--quiet', '--ignore-all-space', '--', $Entry.path) -AllowFailure
+function Get-BulkChangeDetails {
+    param([string]$Repo, [string]$Head, [object[]]$Entries, [bool]$ContentGateClear, [hashtable]$Environment = @{})
+
+    $entryCount = 0
+    foreach ($entry in $Entries) { $entryCount++ }
+    if ([string]::IsNullOrEmpty($Head) -or -not $ContentGateClear -or $entryCount -eq 0) {
+        return [pscustomobject]@{ numstat = @{}; substantivePaths = @{}; available = $false }
+    }
+    $numstatResult = Invoke-Git -Repo $Repo -Arguments @('diff', '--numstat', '-z', '--no-renames', $Head, '--') -Environment $Environment
+    $substantiveResult = Invoke-Git -Repo $Repo -Arguments @('diff', '--name-only', '-z', '--ignore-all-space', '--no-renames', $Head, '--') -Environment $Environment
     return [pscustomobject]@{
-        added = $added
-        deleted = $deleted
-        hunks = $hunks
-        whitespaceOnly = $whitespace.ExitCode -eq 0
+        numstat = ConvertFrom-NumstatBytes -Bytes $numstatResult.StdoutBytes -Entries $Entries
+        substantivePaths = ConvertFrom-NulPathSet -Bytes $substantiveResult.StdoutBytes -Entries $Entries
+        available = $true
     }
 }
 
@@ -631,16 +863,63 @@ function Get-Context {
     param([object]$RepositoryInfo)
 
     $indexBefore = Get-IndexHash $RepositoryInfo
+    $indexSnapshotPath = Join-Path $RepositoryInfo.StateDir ('.read-index-' + [Guid]::NewGuid().ToString('N'))
+    $gitReadEnvironment = @{}
+    if ([System.IO.File]::Exists($RepositoryInfo.IndexPath)) {
+        [System.IO.File]::Copy($RepositoryInfo.IndexPath, $indexSnapshotPath, $false)
+        $gitReadEnvironment['GIT_INDEX_FILE'] = $indexSnapshotPath
+    }
+    try {
     $head = Get-RepositoryHead $RepositoryInfo.Root
     $branch = Get-RepositoryBranch $RepositoryInfo.Root
     $operations = Get-OperationState $RepositoryInfo
-    $statusEntries = Get-WorktreeStatus $RepositoryInfo.Root
+    Assert-IndexUnchanged -RepositoryInfo $RepositoryInfo -BeforeHash $indexBefore -Stage 'repository-state'
+    $statusCandidates = Get-StatusCandidatePaths -Repo $RepositoryInfo.Root -Environment $gitReadEnvironment
+    Assert-IndexUnchanged -RepositoryInfo $RepositoryInfo -BeforeHash $indexBefore -Stage 'status-candidates'
+    $candidateAttributes = Get-PathAttributesBulk -Repo $RepositoryInfo.Root -Paths $statusCandidates
+    Assert-IndexUnchanged -RepositoryInfo $RepositoryInfo -BeforeHash $indexBefore -Stage 'candidate-attributes'
+    $statusEnvironment = @{}
+    foreach ($entry in $gitReadEnvironment.GetEnumerator()) {
+        $statusEnvironment[[string]$entry.Key] = [string]$entry.Value
+    }
+    foreach ($entry in (Get-FilterNeutralizationEnvironment -AttributesByPath $candidateAttributes).GetEnumerator()) {
+        $statusEnvironment[[string]$entry.Key] = [string]$entry.Value
+    }
+    $statusEntries = Get-WorktreeStatus -Repo $RepositoryInfo.Root -Environment $statusEnvironment
+    Assert-IndexUnchanged -RepositoryInfo $RepositoryInfo -BeforeHash $indexBefore -Stage 'status'
+    $paths = @($statusEntries | ForEach-Object { [string]$_.path })
+    $attributesByPath = Get-PathAttributesBulk -Repo $RepositoryInfo.Root -Paths $paths
+    Assert-IndexUnchanged -RepositoryInfo $RepositoryInfo -BeforeHash $indexBefore -Stage 'attributes'
+    $reparseByPath = @{}
+    $contentGateFindings = New-Object System.Collections.ArrayList
+
+    foreach ($entry in $statusEntries) {
+        $reparseBlock = Get-ReparseBlock -Root $RepositoryInfo.Root -FullPath $entry.fullPath
+        $reparseByPath[[string]$entry.path] = $reparseBlock
+        if ($null -ne $reparseBlock) {
+            [void]$contentGateFindings.Add([pscustomobject]@{ path = $entry.path; rule = 'reparse-point' })
+        }
+        $attributes = $attributesByPath[[string]$entry.path]
+        if ($attributes.filter -notin @('unspecified', 'unset')) {
+            [void]$contentGateFindings.Add([pscustomobject]@{ path = $entry.path; rule = 'filter' })
+        }
+        if ($attributes.ident -notin @('unspecified', 'unset')) {
+            [void]$contentGateFindings.Add([pscustomobject]@{ path = $entry.path; rule = 'ident' })
+        }
+        if ($attributes.'working-tree-encoding' -notin @('unspecified', 'unset', 'UTF-8', 'utf-8')) {
+            [void]$contentGateFindings.Add([pscustomobject]@{ path = $entry.path; rule = 'working-tree-encoding' })
+        }
+    }
+    $contentGateClear = $contentGateFindings.Count -eq 0
+    $bulkDetails = Get-BulkChangeDetails -Repo $RepositoryInfo.Root -Head $head -Entries $statusEntries -ContentGateClear $contentGateClear -Environment $gitReadEnvironment
+    Assert-IndexUnchanged -RepositoryInfo $RepositoryInfo -BeforeHash $indexBefore -Stage 'bulk-diff'
     $files = New-Object System.Collections.ArrayList
     $secretFindings = New-Object System.Collections.ArrayList
 
     foreach ($entry in $statusEntries) {
-        $exists = [System.IO.File]::Exists($entry.fullPath)
-        $isDirectory = [System.IO.Directory]::Exists($entry.fullPath)
+        $reparse = $null -ne $reparseByPath[[string]$entry.path]
+        $exists = -not $reparse -and [System.IO.File]::Exists($entry.fullPath)
+        $isDirectory = -not $reparse -and [System.IO.Directory]::Exists($entry.fullPath)
         $nestedRepository = $isDirectory -and (
             [System.IO.Directory]::Exists((Join-Path $entry.fullPath '.git')) -or
             [System.IO.File]::Exists((Join-Path $entry.fullPath '.git'))
@@ -648,16 +927,17 @@ function Get-Context {
         $size = if ($exists) { (Get-Item -LiteralPath $entry.fullPath).Length } else { 0 }
         $bytes = if ($exists -and $size -le $script:MaxTextBytes) { [System.IO.File]::ReadAllBytes($entry.fullPath) } else { $null }
         $binary = if ($null -eq $bytes) { $size -gt $script:MaxTextBytes } else { Test-BinaryBytes $bytes }
-        $attributes = Get-PathAttributes -Repo $RepositoryInfo.Root -Path $entry.path
-        $stats = Get-ChangeStats -Repo $RepositoryInfo.Root -Entry $entry -Size $size
+        $attributes = $attributesByPath[[string]$entry.path]
+        $stats = if ($bulkDetails.numstat.ContainsKey([string]$entry.path)) { $bulkDetails.numstat[[string]$entry.path] } else { $null }
         $extension = [System.IO.Path]::GetExtension($entry.path).ToLowerInvariant()
         $generated = $attributes.'linguist-generated' -eq 'set' -or $attributes.generated -eq 'set'
-        $reparse = if ($exists) { Test-ReparsePoint $entry.fullPath } else { $false }
         if ($null -ne $bytes -and ($entry.kind -eq '?' -or $entry.status.Substring(0, 1) -eq 'A')) {
             foreach ($finding in (Get-SecretFindings -Path $entry.path -Bytes $bytes)) {
                 [void]$secretFindings.Add($finding)
             }
         }
+        $detailsEligible = $bulkDetails.available -and $entry.tracked -and -not $reparse -and
+            [string]::IsNullOrEmpty([string]$entry.originalPath) -and $entry.status -notmatch 'D' -and -not $binary
         [void]$files.Add([pscustomobject]@{
             id = 'f' + ($files.Count + 1)
             path = $entry.path
@@ -677,14 +957,16 @@ function Get-Context {
             directory = $isDirectory
             nestedRepository = $nestedRepository
             attributes = $attributes
-            added = $stats.added
-            deleted = $stats.deleted
-            hunks = $stats.hunks
-            whitespaceOnly = $stats.whitespaceOnly
+            added = if ($null -eq $stats) { $null } else { $stats.added }
+            deleted = if ($null -eq $stats) { $null } else { $stats.deleted }
+            hunks = $null
+            whitespaceOnly = [bool]($detailsEligible -and -not $bulkDetails.substantivePaths.ContainsKey([string]$entry.path))
+            diffDetailsDeferred = $true
         })
     }
 
     $log = Get-GitText -Repo $RepositoryInfo.Root -Arguments @('log', '-20', '--format=%s') -AllowFailure
+    Assert-IndexUnchanged -RepositoryInfo $RepositoryInfo -BeforeHash $indexBefore -Stage 'log'
     $subjects = if ($log.ExitCode -eq 0) {
         @($log.Text -split "\r?\n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     }
@@ -702,6 +984,11 @@ function Get-Context {
         }
     })
 
+    $finalHead = Get-RepositoryHead $RepositoryInfo.Root
+    $finalBranch = Get-RepositoryBranch $RepositoryInfo.Root
+    if ($finalHead -ne $head -or $finalBranch -ne $branch) {
+        Throw-ToolkitError 'WORKTREE_DRIFT' 'HEAD or branch changed during repository analysis.'
+    }
     Assert-IndexUnchanged -RepositoryInfo $RepositoryInfo -BeforeHash $indexBefore
     return [pscustomobject]@{
         schemaVersion = $script:SchemaVersion
@@ -719,6 +1006,15 @@ function Get-Context {
         recentSubjects = @($subjects)
         style = Get-StyleFeatures $subjects
         secretFindings = @($secretFindings)
+        contentGateClear = $contentGateClear
+        contentGateFindings = @($contentGateFindings)
+        diffDetailsDeferred = $true
+    }
+    }
+    finally {
+        if ([System.IO.File]::Exists($indexSnapshotPath)) {
+            [System.IO.File]::Delete($indexSnapshotPath)
+        }
     }
 }
 
@@ -746,8 +1042,15 @@ function Invoke-AnalyzeAction {
         recentSubjects = $context.recentSubjects
         style = $context.style
         secretFindings = $context.secretFindings
+        contentGateClear = $context.contentGateClear
+        contentGateFindings = $context.contentGateFindings
         stagedCount = @($context.files | Where-Object { $_.staged }).Count
         conflictCount = @($context.files | Where-Object { $_.conflicted }).Count
+        performance = [pscustomobject]@{
+            mode = 'fast'
+            elapsedMilliseconds = $script:InvocationStopwatch.ElapsedMilliseconds
+            gitProcessCount = $script:GitProcessCount
+        }
     }
 }
 
@@ -1188,6 +1491,10 @@ function Assert-NormalizePreconditions {
 function Invoke-NormalizeAction {
     param([object]$RepositoryInfo)
     Recover-NormalizationJournal $RepositoryInfo
+    if ([System.IO.File]::Exists((Join-Path $RepositoryInfo.StateDir 'plan.json')) -or
+        [System.IO.File]::Exists((Join-Path $RepositoryInfo.StateDir 'state.json'))) {
+        Throw-ToolkitError 'PLAN_ACTIVE' 'Normalization is unavailable while a saved commit plan exists; finish or clear the plan first.'
+    }
     $context = Get-Context $RepositoryInfo
     Assert-NormalizePreconditions $context
     $allowed = if ($null -ne $Extensions -and $Extensions.Count -gt 0) { @($Extensions | ForEach-Object { $_.ToLowerInvariant() }) } else { $script:DefaultExtensions }
@@ -1454,7 +1761,7 @@ function Invoke-SavePlanAction {
             if (-not $contextByPath.ContainsKey($path)) { Throw-ToolkitError 'PLAN_INVALID' "Plan path is not in the analyzed change set: $path" }
             if ($usedPaths.ContainsKey($path)) { Throw-ToolkitError 'PLAN_INVALID' "Plan path appears in more than one group: $path" }
             if ($contextByPath[$path].directory -or $contextByPath[$path].nestedRepository) { Throw-ToolkitError 'PLAN_INVALID' "Directories and nested repositories cannot be selected: $path" }
-            if (Test-ReparsePoint $fullPath) { Throw-ToolkitError 'PLAN_INVALID' "Reparse point cannot be selected: $path" }
+            if ($null -ne (Get-ReparseBlock -Root $RepositoryInfo.Root -FullPath $fullPath)) { Throw-ToolkitError 'PLAN_INVALID' "Reparse path cannot be selected: $path" }
             $usedPaths[$path] = $true
             foreach ($treeEntry in (Get-ExpectedTreeEntries -RepositoryInfo $RepositoryInfo -ContextFile $contextByPath[$path])) {
                 [void]$expectedEntries.Add($treeEntry)
@@ -1582,6 +1889,60 @@ function Confirm-PendingCommit {
     return $true
 }
 
+function Test-DiffCheckHasActionableError {
+    param([object]$CheckResult, [object]$RepositoryInfo, [object]$Group, [object]$Context)
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$CheckResult.Stderr)) { return $true }
+    $contextByPath = @{}
+    foreach ($file in @($Context.files)) { $contextByPath[[string]$file.path] = $file }
+    $linesByPath = @{}
+    foreach ($pathValue in @($Group.paths)) {
+        $path = [string]$pathValue
+        $file = $contextByPath[$path]
+        if ($null -eq $file -or $file.status -match 'D') { continue }
+        $fullPath = Join-Path $RepositoryInfo.Root $path.Replace('/', '\')
+        if (-not [System.IO.File]::Exists($fullPath)) { continue }
+        $text = (ConvertFrom-TextBytes ([System.IO.File]::ReadAllBytes($fullPath))).Text
+        $linesByPath[$path] = @([regex]::Split($text, "\r\n|\n|\r"))
+        if (-not $file.tracked) {
+            foreach ($line in $linesByPath[$path]) {
+                if ($line -match '[ \t]+$') { return $true }
+            }
+        }
+    }
+
+    $output = ConvertFrom-Utf8Bytes $CheckResult.StdoutBytes
+    if ([string]::IsNullOrWhiteSpace($output)) { return $CheckResult.ExitCode -ne 0 }
+    $skipContextLine = $false
+    foreach ($diagnostic in @($output -split "\r?\n")) {
+        if ([string]::IsNullOrEmpty($diagnostic)) { continue }
+        if ($skipContextLine -and $diagnostic.StartsWith('+')) {
+            $skipContextLine = $false
+            continue
+        }
+        $skipContextLine = $false
+        $matchedTrailingWhitespace = $false
+        foreach ($pathValue in @($Group.paths | Sort-Object { ([string]$_).Length } -Descending)) {
+            $path = [string]$pathValue
+            $prefix = $path + ':'
+            if (-not $diagnostic.StartsWith($prefix, [System.StringComparison]::Ordinal)) { continue }
+            $remainder = $diagnostic.Substring($prefix.Length)
+            if ($remainder -match '^(\d+): trailing whitespace\.$') {
+                $matchedTrailingWhitespace = $true
+                $skipContextLine = $true
+                $lineNumber = [int]$matches[1]
+                if (-not $linesByPath.ContainsKey($path) -or $lineNumber -lt 1 -or $lineNumber -gt $linesByPath[$path].Count) {
+                    return $true
+                }
+                if (([string]$linesByPath[$path][$lineNumber - 1]) -match '[ \t]+$') { return $true }
+                break
+            }
+        }
+        if (-not $matchedTrailingWhitespace) { return $true }
+    }
+    return $false
+}
+
 function Assert-SelectedFilesSafe {
     param([object]$RepositoryInfo, [object]$Group, [object]$Context)
     $contextByPath = @{}
@@ -1622,8 +1983,8 @@ function Assert-SelectedFilesSafe {
         Throw-ToolkitError 'SECRET_REVIEW_REQUIRED' 'Credential-like content requires human review.' @($findings)
     }
     $arguments = @('diff', '--check', '--') + @($Group.paths)
-    $check = Invoke-Git -Repo $RepositoryInfo.Root -Arguments $arguments -AllowFailure
-    if ($check.ExitCode -ne 0) {
+    $check = Invoke-Git -Repo $RepositoryInfo.Root -Arguments $arguments -AllowFailure -StrictWhitespace
+    if (Test-DiffCheckHasActionableError -CheckResult $check -RepositoryInfo $RepositoryInfo -Group $Group -Context $Context) {
         Throw-ToolkitError 'VALIDATION_FAILED' 'git diff --check reported whitespace errors in the selected group.'
     }
 }
@@ -1926,6 +2287,8 @@ function Invoke-ClearAction {
     }
     return [pscustomobject]@{ cleared = $true; stateDirectory = $RepositoryInfo.StateDir }
 }
+
+if ($InternalLoadOnly) { return }
 
 $resultEnvelope = $null
 $lockHandle = $null

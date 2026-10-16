@@ -7,6 +7,7 @@
       "enum": [
         "new",
         "continue",
+        "continue_or_create",
         "status",
         "list",
         "cancel",
@@ -24,7 +25,29 @@
     },
     "skill_name": {
       "type": ["string", "null"],
-      "enum": ["list_active_agent_sessions", null]
+      "enum": ["list_active_agent_sessions", "inspect_agent_workspace", "stop_agent_session", "ccswitch", null]
+    },
+    "overview_scope": {
+      "type": ["string", "null"],
+      "enum": ["all", "project", "session", null]
+    },
+    "overview_executor": {
+      "type": ["string", "null"],
+      "enum": ["codex", "claude", null]
+    },
+    "project_query": {
+      "type": ["string", "null"]
+    },
+    "session_query": {
+      "type": ["string", "null"]
+    },
+    "ccswitch_action": {
+      "type": ["string", "null"],
+      "enum": ["overview", "providers", "health", "routing_status", "usage", "unsupported_mutation", null]
+    },
+    "usage_period": {
+      "type": ["string", "null"],
+      "enum": ["today", "yesterday", "last_7_days", "last_30_days", null]
     },
     "project_alias": {
       "type": ["string", "null"]
@@ -51,6 +74,12 @@
   "required": [
     "action",
     "skill_name",
+    "overview_scope",
+    "overview_executor",
+    "project_query",
+    "session_query",
+    "ccswitch_action",
+    "usage_period",
     "executor",
     "project_alias",
     "session_ref",

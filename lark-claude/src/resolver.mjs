@@ -36,18 +36,88 @@ function resolveSession(intent, config, store, message) {
 }
 
 export function resolveIntent(intent, config, store, message, internalSkills = null) {
+  const overviewFields = ["overview_scope", "overview_executor", "project_query", "session_query"];
   if (intent.needs_clarification || intent.action === "clarify") {
     return { type: "reply", text: intent.clarification || "请补充执行器、项目或 Session。" };
+  }
+  if (intent.action !== "internal_skill"
+    && (intent.skill_name != null || intent.ccswitch_action != null || intent.usage_period != null
+      || overviewFields.some((field) => intent[field] != null))) {
+    return { type: "reply", text: "内部技能查询不能与项目或 Session 操作混用。" };
   }
   if (["help", "unknown"].includes(intent.action)) return { type: intent.action };
   if (intent.action === "list") return { type: "list" };
 
+  if (intent.skill_name !== "ccswitch"
+    && (intent.ccswitch_action != null || intent.usage_period != null)) {
+    return { type: "reply", text: "CC Switch 查询参数不能用于其他操作，请分开发送。" };
+  }
+  if (intent.skill_name !== "inspect_agent_workspace" && overviewFields.some((field) => intent[field] != null)) {
+    return { type: "reply", text: "项目与 Session 概况参数不能用于其他操作，请分开发送。" };
+  }
+
   if (intent.action === "internal_skill") {
-    const forbidden = ["executor", "project_alias", "session_ref", "session_name", "request_ref", "content"];
+    const commonForbidden = ["executor", "project_alias", "session_name", "request_ref", "content", "clarification"];
+    if (!internalSkills?.has?.(intent.skill_name)) return { type: "unknown" };
+    if (intent.skill_name === "inspect_agent_workspace") {
+      const forbidden = [...commonForbidden, "session_ref", "ccswitch_action", "usage_period"];
+      if (forbidden.some((field) => intent[field] != null)) {
+        return { type: "reply", text: "请将项目与 Session 概况查询和其他操作分成两条消息发送。" };
+      }
+      const scope = intent.overview_scope;
+      const overviewExecutor = intent.overview_executor;
+      const projectQuery = intent.project_query?.trim() || null;
+      const sessionQuery = intent.session_query?.trim() || null;
+      const executorValid = overviewExecutor == null || ["claude", "codex"].includes(overviewExecutor);
+      const scopeValid = scope === "all" ? !projectQuery && !sessionQuery
+        : scope === "project" ? Boolean(projectQuery) && !sessionQuery
+          : scope === "session" ? Boolean(sessionQuery) : false;
+      if (!executorValid || !scopeValid) {
+        return { type: "reply", text: "请明确要查询全部概况、一个项目，还是一个 Session。" };
+      }
+      return {
+        type: "internal_skill",
+        skillName: "inspect_agent_workspace",
+        overviewScope: scope,
+        overviewExecutor,
+        projectQuery,
+        sessionQuery,
+      };
+    }
+    if (intent.skill_name === "stop_agent_session") {
+      if ([...commonForbidden, ...overviewFields].some((field) => intent[field] != null)
+        || !/^ST-[0-9A-F]{32}$/.test(intent.session_ref || "")) {
+        return { type: "reply", text: "请先查询活动 Agent Session，再单独发送一个完整停止ID。" };
+      }
+      return { type: "internal_skill", skillName: intent.skill_name, sessionRef: intent.session_ref };
+    }
+    if (intent.skill_name === "ccswitch") {
+      const forbidden = [...commonForbidden, "session_ref", ...overviewFields];
+      if (forbidden.some((field) => intent[field] != null)) {
+        return { type: "reply", text: "请将 CC Switch 查询与项目任务分成两条消息发送。" };
+      }
+      if (intent.ccswitch_action === "unsupported_mutation") {
+        if (intent.usage_period != null) return { type: "unknown" };
+        return { type: "reply", text: "CC Switch 技能当前仅支持只读查询，不会切换 Provider 或修改路由配置。" };
+      }
+      const actions = new Set(["overview", "providers", "health", "routing_status", "usage"]);
+      if (!actions.has(intent.ccswitch_action)) return { type: "unknown" };
+      if (intent.ccswitch_action !== "usage" && intent.usage_period != null) return { type: "unknown" };
+      const usagePeriod = intent.ccswitch_action === "usage" ? (intent.usage_period || "today") : null;
+      if (usagePeriod && !["today", "yesterday", "last_7_days", "last_30_days"].includes(usagePeriod)) {
+        return { type: "unknown" };
+      }
+      return {
+        type: "internal_skill",
+        skillName: "ccswitch",
+        ccswitchAction: intent.ccswitch_action,
+        usagePeriod,
+      };
+    }
+    const forbidden = [...commonForbidden, "session_ref", ...overviewFields];
     if (forbidden.some((field) => intent[field] != null)) {
       return { type: "reply", text: "请将 Agent Session 查询与项目任务分成两条消息发送。" };
     }
-    if (!internalSkills?.has?.(intent.skill_name)) return { type: "unknown" };
     return { type: "internal_skill", skillName: intent.skill_name };
   }
 
@@ -61,15 +131,27 @@ export function resolveIntent(intent, config, store, message, internalSkills = n
 
   if (intent.action === "new") {
     if (!intent.executor) return { type: "reply", text: "这项工作交给 Codex 还是 Claude？" };
-    const project = resolveProject(config, intent.project_alias);
-    if (!project) return { type: "reply", text: "请明确一个已登记的项目别名。" };
     if (!intent.content?.trim()) return { type: "reply", text: "请说明要执行的具体任务。" };
     return {
-      type: "enqueue",
+      type: "lookup_new",
       action: "new",
       executor: intent.executor,
-      project,
+      project: null,
+      projectQuery: intent.project_alias?.trim() || null,
       name: intent.session_name?.trim() || "未命名任务",
+      content: intent.content.trim(),
+    };
+  }
+
+  if (intent.action === "continue_or_create") {
+    if (!intent.session_name?.trim()) return { type: "reply", text: "请提供要查找或创建的 Session 名称。" };
+    if (!intent.content?.trim()) return { type: "reply", text: "请说明要继续处理的内容。" };
+    return {
+      type: "lookup",
+      executor: intent.executor || null,
+      project: null,
+      projectQuery: intent.project_alias?.trim() || null,
+      name: intent.session_name.trim(),
       content: intent.content.trim(),
     };
   }

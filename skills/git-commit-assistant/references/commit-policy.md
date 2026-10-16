@@ -4,6 +4,16 @@
 
 Safety gates override convenience. Stop instead of guessing when repository state, path identity, encoding, syntax, filter behavior, or plan completion is ambiguous.
 
+## Normalization mode
+
+Normalization is opt-in because it rewrites worktree bytes and can make ordinary commit preparation substantially slower.
+
+- Use `disabled (default)` for ordinary or ambiguous commit requests.
+- Use `disabled (user requested)` when the user asks to preserve the original diff or skip cleanup.
+- Use `enabled (user requested)` only when the user explicitly asks to remove whitespace, blank-line, EOL, BOM, encoding, or similar invalid diff noise.
+
+Do not invoke or recommend `Normalize` in either disabled mode. Do not normalize while `plan.json` or `state.json` exists; finish or explicitly clear the saved plan first. Resuming a plan never adds a cleanup pass.
+
 ## Normalization proofs
 
 The tool may rewrite only when it records one of these proofs:

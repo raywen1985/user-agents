@@ -28,6 +28,7 @@
 # Runtime state
 /.tmp/
 /.token-meter-data/
+/lark-auth-qr.png
 /skills/*-workspace/
 *.log
 *.log.*

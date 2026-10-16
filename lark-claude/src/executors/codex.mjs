@@ -1,47 +1,15 @@
-import fs from "node:fs";
-import path from "node:path";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { loadChildEnvironment } from "../config.mjs";
+import { isSafeFileChange } from "../read-approval-policy.mjs";
 import { compactOneLine, sanitizeText } from "../sanitize.mjs";
-
-function isWithin(root, candidate) {
-  const relative = path.relative(path.resolve(root), path.resolve(root, candidate));
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-function canonicalCandidate(candidate) {
-  let existing = path.resolve(candidate);
-  const suffix = [];
-  while (!fs.existsSync(existing)) {
-    const parent = path.dirname(existing);
-    if (parent === existing) return path.resolve(candidate);
-    suffix.unshift(path.basename(existing));
-    existing = parent;
-  }
-  return path.join(fs.realpathSync.native(existing), ...suffix);
-}
 
 function commandText(params) {
   if (typeof params.command === "string") return params.command;
   return JSON.stringify(params.command || params.commandActions || "");
 }
 
-export function isSafeReadCommand(params, projectPath) {
-  const cwd = params.cwd || projectPath;
-  if (!isWithin(projectPath, cwd)) return false;
-  const command = commandText(params).trim();
-  if (!command || /(?:&&|\|\||[;<>`]|\r|\n)/.test(command)) return false;
-  if (/\b(?:rm|del|erase|move|copy|ren|rename|set-content|add-content|out-file|new-item|remove-item|git\s+(?:add|commit|push|pull|reset|checkout|switch|merge|rebase|clean|restore))\b/i.test(command)) return false;
-  return /^(?:rg(?:\.exe)?|git(?:\.exe)?\s+(?:status|diff|log|show|rev-parse|branch)|Get-Content|Get-ChildItem|Select-String|Test-Path|Resolve-Path|where(?:\.exe)?|dir\b|type\b)/i.test(command);
-}
-
-export function isSafeFileChange(item, projectPath) {
-  if (!item || item.type !== "fileChange" || !Array.isArray(item.changes) || item.changes.length === 0) return false;
-  const canonicalRoot = fs.realpathSync.native(projectPath);
-  return item.changes.every((change) => change.kind?.type !== "delete" && change.kind !== "delete"
-    && isWithin(canonicalRoot, canonicalCandidate(change.path)));
-}
+export { isSafeFileChange } from "../read-approval-policy.mjs";
 
 class CodexRpcClient {
   constructor(executable, cwd) {
@@ -175,13 +143,16 @@ export async function createInitializedCodexClient({
 }
 
 export class CodexExecutor {
-  constructor({ executable, resolveExecutable, invalidateExecutable, clientFactory, timeoutMs, summaryLength = 500 }) {
+  constructor({ executable, resolveExecutable, invalidateExecutable, clientFactory, timeoutMs, summaryLength = 500, beforeRun = null, beforeResume = null, readApprovalPolicy = null }) {
     if (!resolveExecutable && !executable) throw new Error("Codex executable resolver is required");
     this.resolveExecutable = resolveExecutable || (async () => ({ executable, source: "explicit" }));
     this.invalidateExecutable = invalidateExecutable || (() => {});
     this.clientFactory = clientFactory;
     this.timeoutMs = timeoutMs;
     this.summaryLength = summaryLength;
+    this.beforeRun = beforeRun;
+    this.beforeResume = beforeResume;
+    this.readApprovalPolicy = readApprovalPolicy;
   }
 
   async run({ session, content, signal, onApproval, onNativeId }) {
@@ -190,6 +161,14 @@ export class CodexExecutor {
     let latestAgentText = "";
     let timeout;
     try {
+      if (this.beforeRun) {
+        const guarded = await this.beforeRun(session);
+        if (!guarded?.ok) {
+          const error = new Error("无法安全验证项目目录。");
+          error.code = guarded?.reason || "project_unverified";
+          throw error;
+        }
+      }
       ({ client } = await createInitializedCodexClient({
         cwd: session.project_path,
         resolveExecutable: this.resolveExecutable,
@@ -204,6 +183,14 @@ export class CodexExecutor {
         runtimeWorkspaceRoots: [session.project_path],
         developerInstructions: "你由飞书远程网关驱动。仅在当前项目内工作；结束时给出最小中文摘要，不要输出完整 transcript。不要调用协作子代理。",
       };
+      if (session.native_id && this.beforeResume) {
+        const guarded = await this.beforeResume(session);
+        if (!guarded?.ok) {
+          const error = new Error(guarded?.reason === "busy" ? "原生 Codex Session 正在使用中。" : "无法安全验证原生 Codex Session。");
+          error.code = guarded?.reason || "snapshot_incomplete";
+          throw error;
+        }
+      }
       const threadResult = session.native_id
         ? await client.request("thread/resume", { ...threadParams, threadId: session.native_id, excludeTurns: true })
         : await client.request("thread/start", threadParams);
@@ -221,7 +208,8 @@ export class CodexExecutor {
             }
             if (message.method === "item/commandExecution/requestApproval") {
               const params = message.params || {};
-              const safe = isSafeReadCommand(params, session.project_path);
+              let safe = false;
+              try { safe = await this.readApprovalPolicy?.classify(params, session.project_path) || false; } catch { safe = false; }
               const decision = safe ? "accept" : await onApproval({
                 kind: "command",
                 description: `命令：${compactOneLine(commandText(params), 240)}`,
@@ -231,7 +219,7 @@ export class CodexExecutor {
             }
             if (message.method === "item/fileChange/requestApproval") {
               const item = client.items.get(message.params?.itemId);
-              const safe = isSafeFileChange(item, session.project_path);
+              const safe = isSafeFileChange(item, session.project_path, this.readApprovalPolicy);
               const description = item?.changes?.map((change) => `${change.kind?.type || change.kind}: ${change.path}`).join("; ") || message.params?.reason || "文件修改";
               const decision = safe ? "accept" : await onApproval({ kind: "file", description: compactOneLine(description, 300) });
               client.respond(message.id, { decision: decision === "approve" ? "accept" : decision === "reject" ? "decline" : decision });

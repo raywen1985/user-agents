@@ -8,10 +8,13 @@ import { once } from "node:events";
 import { DatabaseSync } from "node:sqlite";
 import {
   aggregateActiveAgentRecords,
+  collectActiveAgentSessionRecords,
   collectClaudeCandidates,
   collectCodexCandidates,
+  collectCodexExact,
   formatActiveAgentSessions,
   listActiveAgentSessions,
+  readExactClaudeSession,
   runWindowsSessionProbe,
 } from "../src/active-agent-sessions.mjs";
 
@@ -38,13 +41,14 @@ test("active records deduplicate by agent and native ID with gateway precedence"
   const id = "11111111-1111-4111-8111-111111111111";
   const result = aggregateActiveAgentRecords([
     { provider: "codex", agent: "codex", sessionId: id, nativeId: id, name: "native", status: "running", cwd: "C:\\native", updatedAt: 20 },
-    { provider: "gateway", agent: "codex", sessionId: "CX-1", gatewayId: "CX-1", nativeId: id, name: "managed", status: "waiting_approval", cwd: "C:\\project", updatedAt: 10 },
+    { provider: "gateway", agent: "codex", sessionId: "CX-1", gatewayId: "CX-1", nativeId: id, taskId: "TK-1", name: "managed", status: "waiting_approval", cwd: "C:\\project", updatedAt: 10 },
     { provider: "claude", agent: "claude", sessionId: id, nativeId: id, name: "claude", status: "running", cwd: "C:\\claude", pid: 42, updatedAt: 30 },
   ]);
   assert.equal(result.records.length, 2);
   assert.equal(result.records[0].agent, "codex");
   assert.equal(result.records[0].name, "managed");
   assert.equal(result.records[0].provider, "gateway+codex");
+  assert.deepEqual(result.records[0].gatewayOwners, [{ gatewayId: "CX-1", taskIds: ["TK-1"] }]);
   assert.equal(result.records[1].agent, "claude");
 });
 
@@ -56,6 +60,10 @@ test("active session formatter is bounded and reports hidden rows", () => {
   const text = formatActiveAgentSessions(records, ["one warning"], { displayLimit: 30 });
   assert.match(text, /另有 2 个/);
   assert.match(text, /警告：one warning/);
+  const stoppable = formatActiveAgentSessions([{ ...records[0], stopRef: "ST-0123456789ABCDEF0123456789ABCDEF" }]);
+  assert.match(stoppable, /停止ID: ST-0123456789ABCDEF0123456789ABCDEF/);
+  const unavailable = formatActiveAgentSessions([{ ...records[0], stopCapability: { ready: false, reason: "control_unreachable" } }]);
+  assert.match(unavailable, /停止: 不可用 \(control_unreachable\)/);
 });
 
 test("Codex collector uses latest turns and the highest database generation", async () => {
@@ -74,6 +82,10 @@ test("Codex collector uses latest turns and the highest database generation", as
     const result = await collectCodexCandidates({ codexRoot: root });
     assert.deepEqual(result.records.map((record) => record.nativeId), [idActive]);
     assert.equal(result.records[0].name, "active");
+    assert.equal(result.records[0].turnId, "turn-a");
+    assert.deepEqual(await collectCodexExact({ codexRoot: root, threadId: idDone }), {
+      threadId: idDone, turnId: "turn-b2", status: "completed", startedAt: 300, rolloutOrdinal: 2,
+    });
 
     const incompatible = new DatabaseSync(path.join(root, "thread_history_3.sqlite"));
     incompatible.exec("CREATE TABLE thread_turns (thread_id TEXT)");
@@ -102,10 +114,33 @@ test("Claude collector filters idle and malformed session registrations", async 
       procStart: "134363325751189837", status: "waiting", name: "waiting", updatedAt: 30,
     }));
     fs.writeFileSync(path.join(sessions, "bad.json"), "not-json");
+    fs.utimesSync(path.join(sessions, "active.json"), new Date(1000), new Date(1000));
+    fs.utimesSync(path.join(sessions, "waiting.json"), new Date(2000), new Date(2000));
     const result = await collectClaudeCandidates({ claudeRoot: root });
     assert.deepEqual(result.records.map((record) => record.name), ["waiting", "active"]);
     assert.equal(result.records[0].status, "waiting_input");
     assert.equal(result.skipped, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Claude exact lookup rejects registry identity changes", async () => {
+  const root = tempDirectory();
+  const sessions = path.join(root, "sessions");
+  fs.mkdirSync(sessions);
+  const sourcePath = path.join(sessions, "active.json");
+  const sessionId = "33333333-3333-4333-8333-333333333333";
+  try {
+    fs.writeFileSync(sourcePath, JSON.stringify({
+      pid: 100, sessionId, cwd: "C:\\work", procStart: "134363325751189835", status: "busy",
+    }));
+    assert.equal((await readExactClaudeSession({
+      claudeRoot: root, sourcePath, sessionId, pid: 100, procStart: "134363325751189835",
+    })).ok, true);
+    assert.deepEqual(await readExactClaudeSession({
+      claudeRoot: root, sourcePath, sessionId, pid: 101, procStart: "134363325751189835",
+    }), { ok: false, reason: "identity_changed" });
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -134,6 +169,16 @@ test("session orchestration bounds an uncooperative provider", async () => {
   });
   assert.match(text, /当前没有/);
   assert.match(text, /Codex.*timed out/);
+});
+
+test("active collection exposes structured provider completeness", async () => {
+  const result = await collectActiveAgentSessionRecords({
+    executor: "claude",
+    gatewayTruncated: true,
+    collectCodex: async () => { throw new Error("unselected Codex collector must not run"); },
+    collectClaude: async () => ({ records: [], truncated: true, skipped: 0 }),
+  });
+  assert.deepEqual(result.completeness, { gateway: false, codex: true, claude: false });
 });
 
 test("real Windows probe detects free and held locks plus process identity", { skip: process.platform !== "win32" }, async () => {

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { isSafeFileChange, isSafeReadCommand } from "../src/executors/codex.mjs";
+import { isSafeFileChange } from "../src/executors/codex.mjs";
 import { formatSessionMessage } from "../src/format.mjs";
 import { createInternalSkillRegistry } from "../src/internal-skills.mjs";
 import { normalizeLarkEvent } from "../src/lark.mjs";
@@ -41,15 +41,37 @@ test("session messages always contain executor, project, name and id", () => {
   assert.match(text, /Codex \| unity_asset \| 资源检查 \| CX-1/);
 });
 
-test("resolver creates a new task only for a registered project", () => {
+test("resolver defers new-task project resolution to discovered metadata", () => {
   const config = testConfig();
   withStore((store) => {
     const result = resolveIntent({
       action: "new", executor: "claude", project_alias: "unity", session_name: "检查资源",
       content: "检查资源引用", needs_clarification: false,
     }, config, store, {});
-    assert.equal(result.type, "enqueue");
-    assert.equal(result.project.alias, "unity_asset");
+    assert.equal(result.type, "lookup_new");
+    assert.equal(result.project, null);
+    assert.equal(result.projectQuery, "unity");
+  });
+});
+
+test("resolver routes named work to lookup without inventing project or executor", () => {
+  const config = testConfig();
+  withStore((store) => {
+    const result = resolveIntent({
+      action: "continue_or_create", executor: null, project_alias: null,
+      session_name: "资源泄漏", content: "继续修复第一项", needs_clarification: false,
+    }, config, store, {});
+    assert.deepEqual(result, {
+      type: "lookup", executor: null, project: null,
+      projectQuery: null,
+      name: "资源泄漏", content: "继续修复第一项",
+    });
+    const dynamic = resolveIntent({
+      action: "continue_or_create", executor: "codex", project_alias: "missing",
+      session_name: "资源泄漏", content: "work", needs_clarification: false,
+    }, config, store, {});
+    assert.equal(dynamic.type, "lookup");
+    assert.equal(dynamic.projectQuery, "missing");
   });
 });
 
@@ -71,7 +93,68 @@ test("resolver dispatches only an argument-free registered internal skill", () =
     assert.deepEqual(buildRouterContext(config, store, { reply_to: null }, registry).internal_skills, [{
       name: "list_active_agent_sessions",
       description: "查询当前 PC 上正在工作的 Codex、Claude Code 和网关 Session",
+    }, {
+      name: "inspect_agent_workspace",
+      description: "只读查询本机 Claude Code 和 Codex 的全部、单项目或单 Session 元数据概况",
+    }, {
+      name: "stop_agent_session",
+      description: "使用查询结果中的停止ID精确停止一个正在工作的 Agent Session",
+    }, {
+      name: "ccswitch",
+      description: "只读查询本机 CC Switch 的概况、Provider、健康状态、路由状态和用量",
     }]);
+  });
+});
+
+test("resolver validates scoped metadata-only Agent workspace overview queries", () => {
+  const config = testConfig();
+  const registry = createInternalSkillRegistry({ inspect_agent_workspace: async () => "ok" });
+  const base = {
+    action: "internal_skill",
+    skill_name: "inspect_agent_workspace",
+    overview_scope: "all",
+    overview_executor: null,
+    project_query: null,
+    session_query: null,
+    ccswitch_action: null,
+    usage_period: null,
+    executor: null,
+    project_alias: null,
+    session_ref: null,
+    session_name: null,
+    request_ref: null,
+    content: null,
+    needs_clarification: false,
+    clarification: null,
+  };
+  withStore((store) => {
+    assert.deepEqual(resolveIntent(base, config, store, {}, registry), {
+      type: "internal_skill",
+      skillName: "inspect_agent_workspace",
+      overviewScope: "all",
+      overviewExecutor: null,
+      projectQuery: null,
+      sessionQuery: null,
+    });
+    assert.deepEqual(resolveIntent({
+      ...base,
+      overview_scope: "session",
+      overview_executor: "claude",
+      project_query: "client",
+      session_query: "导入设置优化",
+    }, config, store, {}, registry), {
+      type: "internal_skill",
+      skillName: "inspect_agent_workspace",
+      overviewScope: "session",
+      overviewExecutor: "claude",
+      projectQuery: "client",
+      sessionQuery: "导入设置优化",
+    });
+    assert.equal(resolveIntent({ ...base, overview_scope: "all", project_query: "client" }, config, store, {}, registry).type, "reply");
+    assert.equal(resolveIntent({ ...base, overview_scope: "project", project_query: null }, config, store, {}, registry).type, "reply");
+    assert.equal(resolveIntent({ ...base, executor: "claude" }, config, store, {}, registry).type, "reply");
+    assert.equal(resolveIntent({ ...base, ccswitch_action: "overview" }, config, store, {}, registry).type, "reply");
+    assert.equal(resolveIntent({ ...base, action: "continue", skill_name: null }, config, store, {}, registry).type, "reply");
   });
 });
 
@@ -83,6 +166,79 @@ test("internal skill registry never dispatches unknown names", async () => {
   assert.equal(await registry.dispatch("list_active_agent_sessions", Object.freeze({})), "ok");
   await assert.rejects(() => registry.dispatch("run_shell", {}), /不可用/);
   assert.equal(calls, 1);
+});
+
+test("resolver accepts only an exact stop reference for the stop skill", () => {
+  const config = testConfig();
+  const registry = createInternalSkillRegistry({
+    list_active_agent_sessions: async () => "list",
+    stop_agent_session: async () => "stop",
+  });
+  const intent = {
+    action: "internal_skill", skill_name: "stop_agent_session",
+    executor: null, project_alias: null,
+    session_ref: "ST-0123456789ABCDEF0123456789ABCDEF",
+    session_name: null, request_ref: null, content: null,
+    needs_clarification: false, clarification: null,
+  };
+  withStore((store) => {
+    assert.deepEqual(resolveIntent(intent, config, store, {}, registry), {
+      type: "internal_skill",
+      skillName: "stop_agent_session",
+      sessionRef: intent.session_ref,
+    });
+    for (const sessionRef of [null, "", "ST-1234", "01234567-89ab-cdef-0123-456789abcdef", "CX-261010-ABCDEF", "1234", "active session"]) {
+      assert.equal(resolveIntent({ ...intent, session_ref: sessionRef }, config, store, {}, registry).type, "reply");
+    }
+    for (const fields of [
+      { executor: "codex" }, { project_alias: "unity" }, { session_name: "active" },
+      { request_ref: "RQ-1" }, { content: "run powershell" },
+    ]) {
+      assert.equal(resolveIntent({ ...intent, ...fields }, config, store, {}, registry).type, "reply");
+    }
+  });
+});
+
+test("resolver dispatches only closed CC Switch read actions", () => {
+  const config = testConfig();
+  const registry = createInternalSkillRegistry({ ccswitch: async () => "ok" });
+  const base = {
+    action: "internal_skill", skill_name: "ccswitch", ccswitch_action: "usage",
+    usage_period: null, executor: null, project_alias: null, session_ref: null,
+    session_name: null, request_ref: null, content: null,
+    needs_clarification: false, clarification: null,
+  };
+  withStore((store) => {
+    assert.deepEqual(resolveIntent(base, config, store, {}, registry), {
+      type: "internal_skill", skillName: "ccswitch", ccswitchAction: "usage", usagePeriod: "today",
+    });
+    assert.deepEqual(resolveIntent({ ...base, ccswitch_action: "providers" }, config, store, {}, registry), {
+      type: "internal_skill", skillName: "ccswitch", ccswitchAction: "providers", usagePeriod: null,
+    });
+    assert.equal(resolveIntent({ ...base, ccswitch_action: "switch_provider" }, config, store, {}, registry).type, "unknown");
+    assert.equal(resolveIntent({ ...base, ccswitch_action: "providers", usage_period: "today" }, config, store, {}, registry).type, "unknown");
+    assert.equal(resolveIntent({ ...base, project_alias: "unity" }, config, store, {}, registry).type, "reply");
+    assert.equal(resolveIntent({ ...base, content: "select * from providers" }, config, store, {}, registry).type, "reply");
+    const rejected = resolveIntent({ ...base, ccswitch_action: "unsupported_mutation" }, config, store, {}, registry);
+    assert.equal(rejected.type, "reply");
+    assert.match(rejected.text, /仅支持只读查询/);
+    const foreign = { ...base, skill_name: "list_active_agent_sessions", ccswitch_action: "overview" };
+    assert.equal(resolveIntent(foreign, config, store, {}, registry).type, "reply");
+    const mixedAction = { ...base, action: "new", executor: "codex", project_alias: "unity", content: "work" };
+    assert.equal(resolveIntent(mixedAction, config, store, {}, registry).type, "reply");
+  });
+});
+
+test("internal skill descriptors expose only registered fixed skills", () => {
+  const registry = createInternalSkillRegistry({});
+  assert.deepEqual(registry.descriptors().map((entry) => entry.name), [
+    "list_active_agent_sessions",
+    "inspect_agent_workspace",
+    "stop_agent_session",
+    "ccswitch",
+  ]);
+  assert.equal(registry.has("stop_agent_session"), true);
+  assert.equal(registry.has("stop_all_sessions"), false);
 });
 
 test("scheduler snapshot uses live queue and approval waiters", () => {
@@ -97,6 +253,37 @@ test("scheduler snapshot uses live queue and approval waiters", () => {
     { sessionId: "CX-Q", taskId: "TK-Q", phase: "queued", taskUpdatedAt: 10, queuePosition: 0 },
   ]);
   assert.equal(Object.isFrozen(scheduler.activitySnapshot()), true);
+});
+
+test("scheduler serializes ancestor and descendant project roots", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nested-project-scheduler-"));
+  const store = new Store(path.join(directory, "test.sqlite"));
+  const releases = [];
+  const starts = [];
+  const executor = {
+    run: ({ session }) => new Promise((resolve) => {
+      starts.push(session.project_path);
+      releases.push(() => resolve({ nativeId: null, summary: "done" }));
+    }),
+  };
+  const scheduler = new Scheduler({ store, executors: { codex: executor }, onMessage: async () => {}, maxConcurrentProjects: 2 });
+  try {
+    const parent = store.createSession({ executor: "codex", projectAlias: "parent", projectPath: "D:\\ulibs", name: "parent" });
+    const child = store.createSession({ executor: "codex", projectAlias: "child", projectPath: "D:\\ulibs\\client", name: "child" });
+    scheduler.enqueue(store.createTask({ sessionId: parent.id, messageId: "nested-1", action: "new", content: "one" }), parent, { defer: true });
+    scheduler.enqueue(store.createTask({ sessionId: child.id, messageId: "nested-2", action: "new", content: "two" }), child, { defer: true });
+    scheduler.drain();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(starts.length, 1);
+    releases.shift()();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(starts.length, 2);
+    releases.shift()();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  } finally {
+    store.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("store enriches only matching bounded scheduler references", () => {
@@ -137,11 +324,4 @@ test("Codex auto approval permits only project-local non-delete changes", () => 
   assert.equal(isSafeFileChange({ type: "fileChange", changes: [{ path: path.join(root, "a.txt"), kind: { type: "update" } }] }, root), true);
   assert.equal(isSafeFileChange({ type: "fileChange", changes: [{ path: path.join(root, "a.txt"), kind: { type: "delete" } }] }, root), false);
   assert.equal(isSafeFileChange({ type: "fileChange", changes: [{ path: "C:\\outside.txt", kind: { type: "add" } }] }, root), false);
-});
-
-test("Codex command policy allows simple reads and rejects compound or mutating commands", () => {
-  const root = "D:\\WA\\unity_asset";
-  assert.equal(isSafeReadCommand({ cwd: root, command: "rg -n TODO Assets" }, root), true);
-  assert.equal(isSafeReadCommand({ cwd: root, command: "rg TODO .; Remove-Item x" }, root), false);
-  assert.equal(isSafeReadCommand({ cwd: root, command: "git commit -am test" }, root), false);
 });
