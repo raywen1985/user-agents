@@ -74,7 +74,8 @@ Claude 执行器，因此同一自我判忙缺陷也适用于已绑定原生 Cla
 - 原生 turn 为 `inProgress` 时返回 `busy`。
 - 多个 Gateway Session 指向同一 native ID，或候选 Gateway ID 与当前 Session 不同
   时，以 `identity_conflict` 或 `stale_target` 失败。
-- 原生 ID 缺失、工程目录变化、目录扫描不完整时仍按原有原因失败。
+- Gateway 已绑定的 native ID 在完整目录中找不到对应原生记录、工程目录变化或目录
+  扫描不完整时，仍按原有原因失败；没有绑定 native ID 的新会话不走续接复验。
 - 候选查询阶段的 Gateway busy 聚合保持不变，避免用户向真正执行中的 Session
   再次提交任务。
 - 原生占用在预检成功后、`thread/resume` 前发生竞争时，resume 失败且不会发送
