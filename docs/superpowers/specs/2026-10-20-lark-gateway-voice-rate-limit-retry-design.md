@@ -32,9 +32,10 @@ stdout 读取错误信封，并在检查信封前先按退出码抛出通用错�
 JSON 才作为 API 信封。`ok: false` 的信封必须先于进程退出码判断，从而保留
 `error.code`、`error.subtype` 和 `error.retryable` 等结构化信息。
 
-权限错误继续映射为 `VOICE_SCOPE_MISSING`。识别接口满足以下条件时映射为内部可重试
-限流：错误码为 `99991400` 或 subtype 为 `rate_limit`，并且信封没有明确设置
-`retryable: false`。其它非零退出、无效 JSON 和 API 错误不重试。
+权限错误继续映射为 `VOICE_SCOPE_MISSING`。识别接口仅在同时满足以下条件时映射为
+内部可重试限流：错误码为 `99991400` 或 subtype 为 `rate_limit`，且
+`error.retryable === true`。字段缺失、`null`、其它值和明确的 `false` 均不重试。
+其它非零退出、无效 JSON 和 API 错误也不重试。
 
 ### 有界重试
 
@@ -69,7 +70,7 @@ audio 事件
 - 非零退出且 stderr 包含缺少 scope 信封时，映射为 `VOICE_SCOPE_MISSING`。
 - 首次限流、后续成功时，只下载和转码一次，并返回识别文本。
 - 连续四次限流时，只等待三次并返回 `VOICE_RATE_LIMITED`。
-- `retryable: false` 或非限流 API 错误不重试。
+- `retryable` 为 `false`、缺失或非布尔值，以及非限流 API 错误均不重试。
 - stdout 成功信封仍按原路径解析，stderr 中的非 JSON 文本不会暴露给用户。
 - `voiceFailureText` 对 `VOICE_RATE_LIMITED` 返回明确中文提示。
 - 运行 `lark-claude` 全量 Node 测试，确认 post 路由、Session 续接和语音原流程无回归。
