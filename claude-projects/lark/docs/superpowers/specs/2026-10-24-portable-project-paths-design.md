@@ -85,22 +85,49 @@ PATH shadowing, non-Application commands, reparse points, invalid binaries, and
 multiple valid candidates.
 
 Before changing the installation, the script verifies every required
-executable and prepares all generated files in memory. It acquires a single
-installation lock and creates a recovery journal containing byte-for-byte
-backups of each destination plus the prior Scheduled Task XML, if any. All new
-files are written and validated as same-directory temporary files before the
-first replacement.
+executable and prepares all generated files in memory. It refuses to mutate an
+installation while the existing gateway task or its recorded process is
+running, so an install cannot interrupt active sessions or mistake an old
+process for the new installation. The user must stop the gateway first.
+
+The script then acquires a single installation lock and constructs recovery
+state in a new, non-reparse generation directory. Backups are created before
+any destination replacement. A versioned manifest uses fixed logical target
+IDs, not journal-supplied filesystem paths, and records for each file either an
+absent-target tombstone or a backup filename, byte length, and SHA-256 digest.
+It also records whether the Scheduled Task was absent or stores its exported
+XML, digest, and stopped state. Every backup is read back and verified.
+
+The manifest is first written as a pending file and is atomically renamed to
+the active journal only after every backup and all proposed same-directory
+temporary files validate. No destination changes before that rename. A crash
+during construction can therefore leave only an uncommitted pending directory,
+which the next run validates as uncommitted and removes without restoration. An
+active journal is restored only after its version, logical targets, lengths,
+and digests validate. A corrupt or incomplete active journal fails closed and
+requires explicit manual recovery; it never deletes or overwrites destinations.
 
 The commit order is local gateway configuration, local project policy, Claude
 local settings, installer ownership state, Scheduled Task registration, task
-start, and bounded health verification. Any caught failure restores the files
-and prior task from the journal. A process interruption may leave a journal;
-the next installer run restores that recorded generation before beginning new
-discovery. Only successful health verification removes the journal and
-backups. Thus atomic file replacement is combined with transaction-level
-recovery rather than presented as cross-file atomicity. A discovery or
-validation failure occurs before the journal and reports each missing
-dependency with a remediation hint.
+start, and bounded health verification. The installer creates a unique
+installation generation and writes it into the local gateway configuration.
+The gateway copies that generation, its canonical Node executable, canonical
+entry point, PID, and process-start identity into health state. Installation
+succeeds only when health reports the expected generation and paths and the PID
+and start identity match the newly created live process. Stale health is never
+accepted.
+
+Any caught failure stops only a process whose PID, start identity, and
+installation generation match the process started by this transaction, then
+restores the files and prior task from the journal. Because a previously
+running installation is rejected before mutation, the prior task state is
+either stopped or absent and is restored in that state. A process interruption
+may leave an active journal; the next installer run validates and restores that
+recorded generation before beginning new discovery. Only successful bound
+health verification removes the journal and backups. Thus atomic file
+replacement is combined with transaction-level recovery rather than presented
+as cross-file atomicity. A discovery or validation failure occurs before the
+journal and reports each missing dependency with a remediation hint.
 
 The installer registers `LarkClaudeGateway` with resolved absolute values for
 the Node executable, gateway entry point, and working directory. These absolute
@@ -110,12 +137,30 @@ The installer is idempotent. Re-running it refreshes managed paths without
 duplicating configuration or permission entries. Fault-injection tests cover
 each replacement, task registration, task start, and health-check boundary and
 verify restoration on both an immediate failure and the next-run recovery path.
+Tests also cover interruption during journal construction, a corrupt active
+journal, stale health, a preexisting running gateway, and health failure after
+the exact new process starts.
 
 ## Claude Code Settings
 
 `.claude/settings.json` contains only portable, project-relative permissions.
 Machine-specific permissions are written to the ignored
 `.claude/settings.local.json` during installation.
+
+The tracked settings allowlist is intentionally exact and minimal:
+
+- `Bash(npm test *)`;
+- `Bash(node --test test/*.test.mjs)`;
+- `Bash(powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop.ps1)`;
+- `WebSearch`; and
+- `WebFetch(domain:open.feishu.cn)`.
+
+Only an existing local entry that exactly matches this table moves to tracked
+settings during source migration. Broad commands such as `Bash(node *)`,
+package installation, process/PID diagnostics, filesystem reads, program
+discovery, temporary paths, and every absolute executable rule remain local
+and unmanaged unless the installer adds an exact machine permission it owns.
+Portability alone never promotes a permission into the tracked allowlist.
 
 When updating local settings, the installer preserves existing keys and
 permission entries it does not manage. The ignored ownership state has a schema
@@ -188,8 +233,10 @@ Focused automated tests cover:
 - missing or stale executable diagnostics;
 - installer discovery and atomic local configuration generation;
 - transaction rollback and interrupted-install recovery at every commit phase;
+- generation-bound health checks and exact new-process rollback;
 - idempotent Claude settings updates that preserve unmanaged entries;
 - conservative first-run settings adoption and exact later ownership cleanup;
+- the exact tracked Claude permission migration table;
 - migration of the current configuration shape.
 
 The complete Node test suite must pass. A read-only dry run of installer
