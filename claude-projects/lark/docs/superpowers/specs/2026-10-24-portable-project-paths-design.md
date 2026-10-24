@@ -144,7 +144,12 @@ On next-run recovery, the installer classifies the current Scheduled Task
 before touching it. Absence is valid. An exact XML/digest match with the
 journaled prior stopped task is also valid and is left stopped. An exact match
 with the proposed task is disabled to prevent future starts but is not stopped
-yet. Any task matching neither the prior nor proposed definition fails closed.
+yet. A disabled-proposed task is also a valid recovery state when its principal,
+action, arguments, working directory, triggers, and settings exactly match the
+journaled proposed task and only its enabled state differs; it remains disabled.
+This makes recovery idempotent if a previous recovery was interrupted
+immediately after task disablement. Any task matching none of the prior,
+proposed, or precisely disabled-proposed definitions fails closed.
 
 Recovery then locates the transaction process while its identity evidence is
 still available. A live process named by the sidecar must match PID, start
@@ -173,7 +178,8 @@ verify restoration on both an immediate failure and the next-run recovery path.
 Tests also cover interruption during journal construction, a corrupt active
 journal, stale health, a preexisting running gateway, and health failure after
 the exact new process starts. Hard-interruption cases cover the interval after
-task start both before and after the first generation-bound health write.
+task start both before and after the first generation-bound health write, plus
+the boundary immediately after recovery disables the proposed task.
 
 ## Claude Code Settings
 
