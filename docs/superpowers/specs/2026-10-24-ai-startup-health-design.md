@@ -43,7 +43,9 @@ The system has three layers:
 
 Codex hooks and Claude hooks both use their native `async = true` command-hook setting. The runner does not detach another process, so its bounded stdout remains attached to the hook host and can be delivered through the client's documented asynchronous hook-output path. The client continues startup without waiting for the runner. Stdin, stdout, and stderr are never inherited by provider descendants.
 
-Version 1 is installed only when all applicable clients satisfy the tested compatibility baseline: Claude Code `2.1.252` or later, Codex CLI `0.163.0-alpha.10.2` or later, and Codex desktop build `26.1013.40934` or later. The installer also validates candidate hook configuration through each available client's configuration-validation path. An older, unknown, or non-validating client is left unchanged and receives an installer-time compatibility message. The installer never falls back to a synchronous hook.
+Version 1 is installed only when every applicable client matches the versioned compatibility matrix. The initial matrix contains the exact tested versions Claude Code `2.1.252`, Codex CLI `0.163.0-alpha.10.2`, and Codex desktop build `26.1013.40934`; it does not imply an open-ended `or later` range. The installer also validates candidate hook configuration through each available client's configuration-validation path. A version not represented by an exact entry or an explicitly tested closed interval, or a client without a working validator, is left unchanged and receives an installer-time compatibility message. The installer never falls back to a synchronous hook.
+
+The compatibility matrix is a versioned test artifact, not an indefinitely assumed range. Every supported Claude, Codex CLI, or desktop upgrade is rerun through the native async-hook integration suite before its exact version is added, or before evidence-backed lower and upper bounds are changed for a closed interval. Unknown, older, newer, or explicitly excluded versions that do not match the matrix remain untouched by the installer.
 
 Codex command hooks are used instead of MCP tool hooks because Codex can run `SessionStart` before MCP connections are ready. Chrome DevTools MCP readiness is therefore inferred from local configuration and client-visible state, not by requiring an MCP tool call during the hook.
 
@@ -87,7 +89,7 @@ disabled
 runner.log
 ```
 
-Writes use a temporary sibling file followed by an atomic replace. Logs are bounded and contain no prompts, transcript content, commands, environment dumps, tokens, credentials, Feishu message content, or browser page data.
+Writes use a temporary sibling file followed by an atomic replace. `runner.log` is capped at 2 MiB and keeps at most three rotated 2 MiB files; rotation uses guarded same-directory replacement and logging failure never changes runner behavior. Logs contain no prompts, transcript content, commands, environment dumps, tokens, credentials, Feishu message content, or browser page data.
 
 ## Registry Schema
 
@@ -103,6 +105,7 @@ Writes use a temporary sibling file followed by an atomic replace. Logs are boun
   "enabled": true,
   "autoStartPolicy": "lark-gateway-task-v1",
   "checkTimeoutMs": 3000,
+  "freshnessSeconds": 60,
   "cooldownSeconds": 300,
   "dependsOn": ["runtime-dependencies"]
 }
@@ -115,7 +118,7 @@ The engine validates before execution:
 - script paths are relative, canonicalize below `startup-health/checks/`, and resolve to regular files;
 - dependency IDs exist and contain no cycles;
 - `scope` is `global` or `surface`, and surface-scoped checks declare at least one supported client;
-- timeouts and cooldowns are within bounded ranges;
+- provider timeouts are 500-15000 milliseconds, diagnostic-probe timeouts are 500-10000 milliseconds, freshness is 5-1800 seconds, and cooldowns are 0-86400 seconds;
 - `autoStartPolicy` is either null or one of the engine's compiled policy IDs;
 - optional diagnostic probes use only supported read-only probe types, bounded arguments, and canonical local executables approved during installation;
 - each check's reason and guidance catalog contains only bounded static text and allowlisted repository-relative documentation paths or fixed local recovery commands, with no interpolation fields;
@@ -162,7 +165,7 @@ The engine owns all automatic-start authority. In version 1 its compiled policy 
 lark-gateway-task-v1 -> Start-ScheduledTask -TaskPath \ -TaskName LarkClaudeGateway
 ```
 
-The exact task path, task name, and operation are constants in the engine and cannot be supplied or changed by the registry, provider output, hook input, or context file. Before invocation, the engine compares the live task definition with the complete expected definition captured in the explicit installation manifest: exactly one action; canonical Node executable; exact quoted `src\gateway.mjs` argument; canonical `lark-claude` working directory; current user SID; interactive logon; limited run level; enabled state; zero execution limit; exact restart count/interval; and the exact expected trigger and action sets with no additional entries. Any ambiguity, task-path mismatch, principal mismatch, or definition drift suppresses start. Adding a future read-only check requires only a registry entry and provider. Adding or changing automatic-start authority requires an explicit engine policy change and dedicated security tests.
+The exact task path, task name, and operation are constants in the engine and cannot be supplied or changed by the registry, provider output, hook input, or context file. Before invocation, the engine compares the live task definition with the complete expected definition captured in the explicit installation manifest: exactly one action; canonical Node executable; exact quoted `src\gateway.mjs` argument; the canonical gateway project directory approved at installation; current user SID; interactive logon; limited run level; enabled state; zero execution limit; exact restart count/interval; and the exact expected trigger and action sets with no additional entries. Any ambiguity, task-path mismatch, principal mismatch, or definition drift suppresses start. Adding a future read-only check requires only a registry entry and provider. Adding or changing automatic-start authority requires an explicit engine policy change and dedicated security tests.
 
 The engine considers its fixed start action only when all of these conditions hold:
 
@@ -174,7 +177,7 @@ The engine considers its fixed start action only when all of these conditions ho
 - the engine owns the cross-session lock;
 - the engine has re-queried the exact scheduled task and the policy's preconditions still hold.
 
-Before invoking the task, the engine atomically persists the attempt timestamp and policy ID to `start-attempts.json`. It then launches an engine-owned helper whose code contains the same fixed task path and name, inside a kill-on-close Job Object with a three-second invocation timeout and bounded output. The helper accepts no task parameters. A successful invocation begins a separate readiness phase that polls provider health for up to ten seconds; this readiness timeout is not part of the invocation timeout. A start action can only start the existing, enabled, definition-matched task named by compiled policy.
+Before invoking the task, the engine atomically persists the attempt timestamp and policy ID to `start-attempts.json`. It then launches an engine-owned helper whose code contains the same fixed task path and name, inside a kill-on-close Job Object with a three-second invocation timeout and bounded output. The helper accepts no task parameters. A successful invocation begins a separate, engine-owned readiness monitor with a 30-second timeout; this monitor is started once and performs its polling internally rather than launching a provider or PowerShell process on every tick. The start invocation and readiness timeouts are independent. A start action can only start the existing, enabled, definition-matched task named by compiled policy.
 
 Malformed output, nonzero exit, timeout, or unexpected provider termination becomes an isolated warning. The runner continues with independent providers.
 
@@ -184,9 +187,11 @@ Every `startup|resume` hook may launch a runner, but only one runner for the Win
 
 After acquiring the lock, the runner re-reads all cache and cooldown files before making any decision. An abandoned mutex is accepted as ownership, recorded as a bounded diagnostic fact, and followed by normal state revalidation. Missing, corrupt, future-dated, or clock-skewed freshness data is treated as stale. On first installation, the installer creates a valid empty start-attempt ledger. If that ledger is later missing or corrupt, the runner suppresses automatic start for the current run, quarantines a corrupt file with a timestamped name, and atomically creates a valid empty ledger under the lock; the next run may auto-start after normal checks.
 
-Every completed snapshot evaluates every global provider once and every enabled surface-scoped provider once per declared client, regardless of which client invoked the runner. Presentation selects the global results plus the requesting surface's results, so a Claude-triggered snapshot cannot suppress a needed Codex or desktop check. The latest completed result has a five-minute default freshness window. When the cache is fresh, a runner skips provider execution and only applies per-client notification deduplication. Provider-check freshness and service-start cooldown are stored and evaluated independently.
+Cache freshness is tracked per provider-and-surface cell. The default is five minutes; the gateway provider uses 60 seconds because its local task, PID, and health-file check is cheap and service liveness can change between wider snapshots. When any surface-scoped provider expires, the runner refreshes that provider for every declared client surface regardless of which client invoked the runner; a global provider runs once. It also refreshes any stale dependency closure and atomically merges still-fresh cells into a new snapshot generation. Presentation selects global results plus the requesting surface's results, so a Claude-triggered refresh cannot suppress a needed Codex or desktop check. An auto-start policy is considered only when its owning global provider completed in the current run and all dependency results are completed or still fresh and ready. Provider freshness, service-start cooldown, and notification deduplication are stored and evaluated independently.
 
-The runner runs up to four independent providers concurrently after their dependencies complete. Each provider has a hard process-tree timeout. The runner has an overall 30-second lifetime and closes all remaining provider Job Objects when that lifetime is exceeded. These limits protect background resources; they are not client-startup deadlines because clients do not wait for an asynchronous hook.
+The runner runs up to four independent providers concurrently after their dependencies complete. Diagnostic probes have their own registry-bounded timeouts and complete before the corresponding provider timeout begins; probe time is never charged to `checkTimeoutMs`. Initial provider timeouts are 2000 milliseconds for model proxy, 3000 for gateway, notifications, and Chrome DevTools MCP, and 5000 for token meter, runtime dependencies, and configuration integrity. Initial diagnostic-probe timeouts are 5000 milliseconds for version and pinned-JSON validation and 8000 for Codex configuration validation.
+
+The runner has a 60-second hard lifetime with explicit phase reservations: at most 20 seconds for cache loading, diagnostic probes, and providers; three seconds for the fixed start helper; 30 seconds for gateway readiness; five seconds for persistence, rendering, and cleanup; and two seconds of shutdown margin. If the check phase exhausts its budget, unfinished work is cancelled and normalized as warnings, and automatic start is skipped so the readiness reservation is never consumed by checks. A runner that does not need auto-start exits as soon as reporting completes. The runner closes all remaining probe, provider, start, and readiness Job Objects when any phase or overall limit is exceeded. These limits protect background resources; they are not client-startup deadlines because clients do not wait for an asynchronous hook. Both clients configure the native asynchronous hook timeout to 75 seconds, which exceeds the runner's hard lifetime and cleanup margin.
 
 All runner top-level paths use `try/finally` and force process exit code `0`. Provider status never propagates to the client process. The hooks return no `continue: false`, blocking decision, permission decision, or rewritten input. A `disabled` marker checked before registry loading is a local kill switch: when present, the runner exits `0` silently without starting providers or services.
 
@@ -202,7 +207,7 @@ AI health: token-meter=warn(claude-hook-missing) | lark-notify=warn(bootstrap-la
 
 The runner emits one bounded, engine-rendered informational hook result after completion while it still owns the hook's stdout. Codex may surface asynchronous hook output at its next safe conversation point. The cache remains the source of truth when a client does not display background output.
 
-Repeated identical warning sets are suppressed for 30 minutes per client. A changed warning set is eligible for immediate display. `latest.json` records the complete normalized results, timestamps, durations, and auto-start outcomes so a future manual status command can show detail without repeating startup work.
+Repeated identical warning sets are suppressed for 30 minutes per client. This interval is intentionally longer than provider freshness: frequent startup or resume events may revalidate health without repeatedly showing an unchanged advisory. A changed warning set is eligible for immediate display. `latest.json` records the complete normalized results, timestamps, durations, and auto-start outcomes so a future manual status command can show detail without repeating startup work.
 
 Messages are rendered only from either the engine's small built-in failure catalog or the installed registry's validated, digest-pinned per-check `reasonCode` and `guidanceId` catalog. They state the condition and an allowlisted manual recovery command or repository-relative documentation path when one is known. Provider strings, paths, and facts are not interpolated into client output. Messages do not claim that a feature was repaired unless the bounded recheck confirms it.
 
@@ -228,7 +233,9 @@ The bootstrap task's missing or disabled state is reported. `LastTaskResult` is 
 
 ### Feishu Remote Gateway
 
-The provider checks that the existing `LarkClaudeGateway` scheduled task is installed and enabled, then evaluates its task state and `run/health.json`. A healthy result requires `updatedAt` no more than 30 seconds old with five seconds of future-clock tolerance, `listenerReady: true`, and `stopping: false`. The recorded PID must identify a live process whose canonical executable equals the configured Node executable and whose process start time matches `startedAt` within five seconds. Access-denied, malformed, or ACL/read failures are warnings and never start-eligible.
+The provider checks that the existing `LarkClaudeGateway` scheduled task is installed and enabled, then evaluates its task state and `run/health.json`. As a rollout prerequisite, the gateway captures an immutable `processStartedAt` at process entry, before listener startup or inbox replay, and includes it in every health document; the existing `startedAt` continues to mean application readiness after those operations. `processStartedAt` is derived from the process clock rather than from readiness time. A healthy result requires `updatedAt` no more than 45 seconds old with 15 seconds of future-clock tolerance, `listenerReady: true`, and `stopping: false`. The recorded PID must identify a live process whose canonical executable equals the configured Node executable and whose OS process start time matches `processStartedAt` within five seconds. A missing `processStartedAt` is incompatible health data, not a reason to widen the identity tolerance.
+
+Because the current gateway writes `health.json` in place, the provider caps the file read at 64 KiB and, on an empty, truncated, sharing-violation, or JSON-parse failure, waits 100 milliseconds and retries exactly once from a newly opened handle. A second failure, oversized file, access denial, malformed schema, or ACL error becomes a warning and is never start-eligible. This compatibility retry does not treat persistently invalid health as healthy.
 
 Task state is mapped exactly:
 
@@ -237,7 +244,7 @@ Task state is mapped exactly:
 - `Disabled`: warn and do not start;
 - missing, unknown, or transient states: warn and do not start.
 
-Immediately before auto-start, the engine re-queries the task and proceeds only if it is still exactly `Ready`, enabled, and has no validated live gateway. The fixed engine policy uses its bounded helper to call `Start-ScheduledTask -TaskPath \ -TaskName LarkClaudeGateway`, then independently polls health every 250 milliseconds for at most 10 seconds. Failure to reach validated health is a warning. Neither provider nor engine registers the task, kills a process, or invokes the restart workflow.
+Immediately before auto-start, the engine re-queries the task and proceeds only if it is still exactly `Ready`, enabled, and has no validated live gateway. The fixed engine policy uses its bounded helper to call `Start-ScheduledTask -TaskPath \ -TaskName LarkClaudeGateway`, then starts the single 30-second readiness monitor. That monitor performs bounded health-file reads in its own loop every 250 milliseconds and samples task state internally without launching a new provider or shell per poll. The task must enter `Running` or `Queued` within three seconds and must not return to `Ready`, become disabled, disappear, or enter an unknown terminal state before readiness. Success requires a newly written, validated health document whose PID, executable, `processStartedAt`, `listenerReady`, `stopping`, and freshness fields all pass the same rules above and whose `updatedAt` is not older than the recorded start attempt. Failure to reach validated health while the task remains active is a startup-timeout warning; early task exit is a distinct warning. Neither provider nor engine registers the task, kills a process, or invokes the restart workflow.
 
 ### Chrome DevTools MCP
 
@@ -276,7 +283,7 @@ The installer:
 3. loads the current Claude `settings.json` and Codex `hooks.json` without discarding unrelated user entries;
 4. records source hashes and, for each existing target, its file identity, ACL, encoding, and timestamped backup; a missing target is recorded as an explicit absent-file identity together with its parent-directory identity and inherited ACL;
 5. stages both candidate files and adds one owned `SessionStart` matcher for `startup|resume` to each client;
-6. sets the command hook to asynchronous execution with a short timeout;
+6. sets the command hook to native asynchronous execution with a 75-second host timeout, exceeding the runner's 60-second hard lifetime and cleanup margin;
 7. validates both candidates with the JSON parser and available client configuration validators;
 8. acquires the installer coordination lock, reopens each existing target with a Windows handle that denies concurrent write sharing, and rechecks its file identity and original hash immediately before replacement; for an absent target, it rechecks that the same parent directory exists and the target is still absent;
 9. atomically replaces existing files with `ReplaceFileW`, preserving their original ACLs; for an absent target, it stages a same-directory candidate with the parent's inherited ACL and uses a no-replace atomic `MoveFileExW`, treating an already-created destination as a conflict; it records each exact installed identity and hash;
@@ -304,21 +311,24 @@ Codex CLI, the Codex desktop app, and the IDE extension share the same user MCP 
 
 Automated tests must cover:
 
-- manifest schema validation, duplicate IDs, invalid paths, links, cycles, unknown dependencies, unknown auto-start policy IDs, and bounded numeric fields;
+- manifest schema validation, duplicate IDs, invalid paths, links, cycles, unknown dependencies, unknown auto-start policy IDs, provider timeouts outside 500-15000 milliseconds, probe timeouts outside 500-10000 milliseconds, freshness outside 5-1800 seconds, cooldowns outside 0-86400 seconds, and other bounded numeric fields;
 - `install-manifest.json` verification of the registry digest, provider canonical paths and SHA-256 digests, and diagnostic-probe executable identity, digest, and exact argument vectors, including refusal of missing, linked, alternate-stream, path-drifted, and digest-drifted inputs;
 - PowerShell AST rejection of shipped providers that contain file/config mutation, direct process/service/task starts, package installation, or dynamic invocation;
 - diagnostic-probe rejection of shells, metacharacter interpretation, configurable working directories, inherited stdin, runtime-config-derived arguments, unapproved profiles, and executable or argument drift;
 - diagnostic-probe process-tree timeout, bounded normalized output, and version/configuration facts delivered to providers without direct child-process creation;
 - adding a fixture provider, existing-profile probes, and new bounded reason/guidance catalog entries through the registry without changing engine code;
-- native async-hook startup latency in real supported Claude Code, Codex CLI, and desktop clients, with no detached child retaining hook pipes;
+- native async-hook startup latency in real supported Claude Code, Codex CLI, and desktop clients, with a 75-second host timeout and no detached child retaining hook pipes;
+- client-version matrix maintenance that rejects an untested upgrade until the async-hook integration suite approves and records it;
 - runner exit `0` for provider errors, timeouts, malformed JSON, registry errors, cache errors, and start failures;
 - SID-scoped mutex ACL, zero-wait acquisition, abandoned ownership, and cooldown behavior across concurrent local and remote desktop invocations;
 - lock losers exiting silently without reading cache, changing cooldown or notification state, or emitting hook output;
 - cache reads and start-ledger reads occurring only after lock acquisition;
 - corrupt, missing, and future-dated cache or start-attempt data behaving conservatively;
 - missing or corrupt start ledgers suppressing auto-start for the current run, quarantining corrupt data, atomically recreating an empty ledger, and permitting normal eligibility on the next run;
-- one all-client provider-by-surface result matrix preventing cross-client freshness suppression;
+- per-cell freshness, a 60-second gateway TTL, a five-minute default TTL, stale dependency-closure refresh, atomic merging of still-fresh cells, and all declared surfaces preventing cross-client freshness suppression;
 - dependency ordering, global-to-surface and same-surface dependency mapping, rejection of global-to-surface dependencies, and a four-provider concurrency limit;
+- diagnostic-probe timeout accounting remaining separate from provider `checkTimeoutMs`;
+- enforcement of the 20-second check phase, three-second start phase, 30-second readiness phase, five-second finalization phase, two-second shutdown margin, and 60-second overall lifetime;
 - disabled, filtered, skipped, timed-out, malformed, and failed dependencies suppressing auto-start;
 - provider Job Object cleanup terminating a forked child tree on timeout or runner exit;
 - concurrent bounded stdout/stderr draining, UTF-8 handling, and flood-output truncation;
@@ -327,7 +337,11 @@ Automated tests must cover:
 - rejection of provider free-form messages, unknown reason/guidance codes, mismatched IDs, oversized facts, and excess keys;
 - strict enforcement that provider results, registry fields, hook input, and context files cannot add to or alter the compiled auto-start policy;
 - exact `\\LarkClaudeGateway` task-definition fingerprint validation for action count, executable, arguments, working directory, principal SID, logon type, run level, enabled state, execution limit, restart settings, and the complete expected trigger/action sets;
-- successful fixed gateway scheduled-task start through the engine-owned helper, termination of a hung helper after three seconds, and a separate bounded ten-second readiness phase polling every 250 milliseconds;
+- successful fixed gateway scheduled-task start through the engine-owned helper, termination of a hung helper after three seconds, and a separate single 30-second readiness monitor polling health internally every 250 milliseconds without per-tick process creation;
+- delayed listener readiness and inbox replay proving that `startedAt` is not used for PID identity, while immutable `processStartedAt` still matches the OS process start time;
+- 45-second health freshness, 15-second future-clock tolerance, missing `processStartedAt`, stale pre-attempt health, and PID reuse remaining warning-only;
+- one retry after a torn, empty, sharing-violating, or malformed `health.json` read, with a second failure or file over 64 KiB remaining warning-only;
+- readiness task-state transitions requiring `Running` or `Queued` within three seconds and rejecting early return to `Ready`, disablement, disappearance, or unknown terminal state;
 - exact `Ready`, `Running`, `Queued`, `Disabled`, missing, and unknown task-state behavior;
 - running-state task result codes not being misreported as completed failures;
 - PID reuse, executable mismatch, process-start mismatch, stale/future health, clock skew, and ACL/read errors remaining warning-only;
@@ -346,13 +360,13 @@ Automated tests must cover:
 - absent Claude or Codex configuration targets using guarded no-replace atomic creation with inherited parent ACLs, losing a create race without overwrite, and rollback deleting an installer-created file only while its identity and installed hash still match;
 - rollback being able to return auto-start to `warn-only` while leaving checks installed and operational;
 - no hook or provider result can emit a blocking decision or nonzero client-facing exit status;
-- bounded logs and results never contain fixture secrets, prompts, transcript text, Feishu identifiers, or browser URLs.
+- `runner.log` rotation at 2 MiB with at most three rotated files, and bounded logs and results never containing fixture secrets, prompts, transcript text, Feishu identifiers, or browser URLs.
 
 Manual acceptance verifies that Claude Code, Codex CLI, and the Codex desktop app become usable immediately while a deliberately stopped installed gateway starts in the background, and that a non-repairable failure produces one concise advisory without preventing normal work.
 
 ## Rollout And Rollback
 
-Rollout first installs and validates the health scripts and pinned parser dependency, writes the approved registry, provider, diagnostic-probe, and task-definition identities and hashes to `install-manifest.json`, and atomically initializes `mode.json` to `warn-only`. It next validates supported client versions and async-hook behavior before transactionally installing the two user-level hooks. Canary acceptance covers startup latency, immediate client termination, resume, client upgrade, malformed hooks, provider child-process cleanup, output delivery, and a full all-surface snapshot. Existing feature installers and scheduled tasks remain unchanged.
+Rollout first deploys the gateway's additive `processStartedAt` health-schema field through the normal gateway update path; the startup-health installer only validates that prerequisite and never rewrites the gateway. It then installs and validates the health scripts and pinned parser dependency, writes the approved registry, provider, diagnostic-probe, and task-definition identities and hashes to `install-manifest.json`, and atomically initializes `mode.json` to `warn-only`. It next validates supported client versions and async-hook behavior before transactionally installing the two user-level hooks. Canary acceptance covers startup latency, immediate client termination, resume, client upgrade, malformed hooks, provider child-process cleanup, output delivery, a cold gateway startup lasting more than ten but less than 30 seconds, and a full all-surface snapshot. Existing feature installers and scheduled tasks remain unchanged.
 
 After the warning-only canary passes, the operator explicitly runs `Enable-StartupHealthAutoStart.ps1`. The script revalidates the installed manifest and exact `\\LarkClaudeGateway` policy preconditions, then atomically changes only `mode.json` to `enabled`. Missing or invalid mode data always behaves as `warn-only`; the runner never infers enablement from registry or provider data.
 
