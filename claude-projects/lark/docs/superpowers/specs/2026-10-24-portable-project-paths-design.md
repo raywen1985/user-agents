@@ -78,11 +78,13 @@ Every selected program is canonicalized and must be an existing regular
 `.exe` file whose path and parent chain contain no reparse point. The installer
 runs a bounded capability probe before accepting it: Node.js, Claude, FFmpeg,
 and SVN must return recognizable version output; Lark CLI must return its
-expected help or version identity. An explicit override changes search
-precedence, not validation. This permits the known user-level Claude and Lark
-install roots without trusting an arbitrary PATH shadow. Discovery tests cover
-PATH shadowing, non-Application commands, reparse points, invalid binaries, and
-multiple valid candidates.
+expected help or version identity. Node.js must report a semantic version that
+satisfies the package requirement `>=24`; incompatible versions are rejected
+before the recovery journal or task is changed. An explicit override changes
+search precedence, not validation. This permits the known user-level Claude and
+Lark install roots without trusting an arbitrary PATH shadow. Discovery tests
+cover PATH shadowing, non-Application commands, reparse points, invalid
+binaries, incompatible Node versions, and multiple valid candidates.
 
 Before changing the installation, the script verifies every required
 executable and prepares all generated files in memory. It refuses to mutate an
@@ -110,7 +112,8 @@ requires explicit manual recovery; it never deletes or overwrites destinations.
 The commit order is local gateway configuration, local project policy, Claude
 local settings, installer ownership state, Scheduled Task registration, task
 start, and bounded health verification. The installer creates a unique
-installation generation and writes it into the local gateway configuration.
+installation generation, writes it into the local gateway configuration, and
+includes it as an explicit gateway command argument in the Scheduled Task.
 The gateway copies that generation, its canonical Node executable, canonical
 entry point, PID, and process-start identity into health state. Installation
 succeeds only when health reports the expected generation and paths and the PID
@@ -129,6 +132,26 @@ replacement is combined with transaction-level recovery rather than presented
 as cross-file atomicity. A discovery or validation failure occurs before the
 journal and reports each missing dependency with a remediation hint.
 
+Active-journal recovery always runs before the ordinary existing-gateway
+rejection. The journal records the proposed task action, including its unique
+generation argument. After task start, the installer waits for either bound
+health or a unique process whose canonical executable and complete command
+arguments match the journaled Node path, entry point, and generation. Once
+found, PID and process-start identity are atomically published in a versioned
+process-identity sidecar before health verification continues.
+
+On next-run recovery, the installer first validates that any currently
+registered new task exactly matches the journaled proposed action, disables and
+stops that task, and then locates the transaction process. A valid sidecar must
+match the live PID, start identity, executable, entry point, and generation. If
+there is no sidecar, recovery performs a bounded query for the unique process
+with the journaled executable and complete generation-bearing command line. It
+stops that process only after recording and rechecking its start identity. Zero
+matches permits restoration; multiple matches, a task definition mismatch, or
+any identity mismatch fails closed without restoring files. This covers a hard
+termination immediately after task start, both before and after the first bound
+health write, without restoring files beneath an unidentified live process.
+
 The installer registers `LarkClaudeGateway` with resolved absolute values for
 the Node executable, gateway entry point, and working directory. These absolute
 values are installation artifacts and are not copied back into tracked files.
@@ -139,7 +162,8 @@ each replacement, task registration, task start, and health-check boundary and
 verify restoration on both an immediate failure and the next-run recovery path.
 Tests also cover interruption during journal construction, a corrupt active
 journal, stale health, a preexisting running gateway, and health failure after
-the exact new process starts.
+the exact new process starts. Hard-interruption cases cover the interval after
+task start both before and after the first generation-bound health write.
 
 ## Claude Code Settings
 
@@ -161,6 +185,27 @@ package installation, process/PID diagnostics, filesystem reads, program
 discovery, temporary paths, and every absolute executable rule remain local
 and unmanaged unless the installer adds an exact machine permission it owns.
 Portability alone never promotes a permission into the tracked allowlist.
+
+The installer-generated local permission table is also exact. Angle-bracketed
+values below are substituted only from validated installation paths:
+
+- `Bash("<lark-cli>" im *)`;
+- `Bash("<lark-cli>" --help)`;
+- `Bash("<lark-cli>" schema *)`;
+- `Bash("<lark-cli>" api *)`;
+- `Bash(MSYS_NO_PATHCONV=1 "<lark-cli>" skills list)`;
+- `Read(<claude-bin-directory>/**)`;
+- `Read(<local-app-data>/Temp/voice-test/**)`; and
+- `Bash(MSYS_NO_PATHCONV=1 "<lark-cli>" api POST
+  /open-apis/speech_to_text/v1/speech/file_recognize --data
+  '@<local-app-data>\\Temp\\voice-test\\pcm-body.json' --as bot 2>&1 | head -12)`.
+
+Paths are rendered in Claude Code's required slash and escaping form after
+canonical validation. The installer grants no package-install, generic
+filesystem, PID/process diagnostic, arbitrary executable, or broader command
+permission. Preexisting local entries outside this table remain preserved and
+unmanaged. Later cleanup removes only exact rendered strings recorded in the
+previous successful ownership state.
 
 When updating local settings, the installer preserves existing keys and
 permission entries it does not manage. The ignored ownership state has a schema
@@ -234,6 +279,7 @@ Focused automated tests cover:
 - installer discovery and atomic local configuration generation;
 - transaction rollback and interrupted-install recovery at every commit phase;
 - generation-bound health checks and exact new-process rollback;
+- hard-interruption recovery before and after the first health write;
 - idempotent Claude settings updates that preserve unmanaged entries;
 - conservative first-run settings adoption and exact later ownership cleanup;
 - the exact tracked Claude permission migration table;
