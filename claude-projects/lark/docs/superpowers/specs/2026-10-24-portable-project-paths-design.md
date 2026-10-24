@@ -140,17 +140,27 @@ arguments match the journaled Node path, entry point, and generation. Once
 found, PID and process-start identity are atomically published in a versioned
 process-identity sidecar before health verification continues.
 
-On next-run recovery, the installer first validates that any currently
-registered new task exactly matches the journaled proposed action, disables and
-stops that task, and then locates the transaction process. A valid sidecar must
-match the live PID, start identity, executable, entry point, and generation. If
-there is no sidecar, recovery performs a bounded query for the unique process
-with the journaled executable and complete generation-bearing command line. It
-stops that process only after recording and rechecking its start identity. Zero
-matches permits restoration; multiple matches, a task definition mismatch, or
-any identity mismatch fails closed without restoring files. This covers a hard
+On next-run recovery, the installer classifies the current Scheduled Task
+before touching it. Absence is valid. An exact XML/digest match with the
+journaled prior stopped task is also valid and is left stopped. An exact match
+with the proposed task is disabled to prevent future starts but is not stopped
+yet. Any task matching neither the prior nor proposed definition fails closed.
+
+Recovery then locates the transaction process while its identity evidence is
+still available. A live process named by the sidecar must match PID, start
+identity, executable, entry point, and generation. If that PID has exited or
+been reused, recovery does not stop the new occupant and instead performs the
+same bounded generation query used when no sidecar exists. The query requires a
+unique process with the journaled executable and complete generation-bearing
+command line. Multiple matches or any live identity mismatch fails closed.
+Zero matches is safe because the proposed task has already been disabled or was
+never registered. One validated match is rechecked by PID and start identity,
+stopped directly, and observed exiting before any file or task restoration.
+Only then does recovery restore the prior task definition or remove a task that
+was previously absent. This covers crashes before task registration and hard
 termination immediately after task start, both before and after the first bound
-health write, without restoring files beneath an unidentified live process.
+health write, without destroying identity evidence or restoring files beneath
+an unidentified live process.
 
 The installer registers `LarkClaudeGateway` with resolved absolute values for
 the Node executable, gateway entry point, and working directory. These absolute
@@ -248,14 +258,15 @@ absolute-path checks. Runtime session `cwd` values and canonical project
 identities also remain absolute after validation.
 
 Tracked source is also part of the portability boundary. The hard-coded SVN
-default and `C:\\Windows` fallback in `src/read-approval-policy.mjs` are removed.
+default and fixed Windows-directory fallback in `src/read-approval-policy.mjs`
+are removed.
 SVN is supplied by validated resolved configuration, and a missing `SystemRoot`
 or `SYSTEMROOT` fails closed when the trusted PowerShell host cannot be derived.
 
 ## Migration
 
 Current machine-specific executable values move from `gateway.json` to the
-ignored local override. The `D:\\WA\\unity_asset` alias override moves from
+ignored local override. The current external-project alias override moves from
 `projects.json` to the ignored local project policy. The tracked base files are
 left portable.
 
