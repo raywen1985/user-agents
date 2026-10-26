@@ -1,0 +1,25 @@
+{
+  "allowedOpenIds": [
+    "ou_3ccfb0c9e06c4cd8e360db35507df2b0"
+  ],
+  "recipientOpenId": "ou_3ccfb0c9e06c4cd8e360db35507df2b0",
+  "maxConcurrentProjects": 2,
+  "routerModel": "sonnet",
+  "workerModel": "sonnet",
+  "routerTimeoutMs": 120000,
+  "workerTimeoutMs": 3600000,
+  "summaryLength": 500,
+  "recentSessionLimit": 12,
+  "powershellApprovalMode": "always_allow",
+  "voice": {
+    "enabled": true,
+    "echoTranscript": true,
+    "engineType": "16k_auto",
+    "maxDurationMs": 60000,
+    "maxBytes": 10485760,
+    "timeoutMs": 60000
+  },
+  "executables": {
+    "codex": "auto"
+  }
+}

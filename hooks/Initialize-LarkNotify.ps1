@@ -282,11 +282,28 @@ function Merge-LNCodexConfig
 {
     param([object]$Document, [string]$NotifyScriptPath)
 
-    if ($null -eq $Document.PSObject.Properties["description"])
+    $hooksRoot = Get-LNProperty $Document "hooks"
+    if ($null -eq $hooksRoot) { return $false }
+    $entriesValue = Get-LNProperty $hooksRoot "Stop"
+    if ($null -eq $entriesValue) { return $false }
+    [object[]]$entries = @($entriesValue)
+    $changed = $false
+    foreach ($entry in $entries)
     {
-        Set-LNProperty $Document "description" "User-level notifications and lifecycle hooks."
+        [object[]]$entryHooks = @(Get-LNProperty $entry "hooks")
+        for ($hookIndex = 0; $hookIndex -lt $entryHooks.Count; $hookIndex++)
+        {
+            $command = [string](Get-LNProperty $entryHooks[$hookIndex] "command")
+            if (Test-LNOwnedCommand $command "codex" $NotifyScriptPath)
+            {
+                $entryHooks[$hookIndex] = New-LNNoOpHook
+                $changed = $true
+            }
+        }
+        if ($changed) { Set-LNProperty $entry "hooks" @($entryHooks) }
     }
-    return Merge-LNEventHook $Document "Stop" "codex" $NotifyScriptPath
+    if ($changed) { Set-LNProperty $hooksRoot "Stop" @($entries) }
+    return $changed
 }
 
 function Test-LNJsonFile
@@ -512,14 +529,31 @@ function Test-LNPathWithinRoot
     catch { return $false }
 }
 
-function Test-LNOfficialCodexNotify
+function Test-LNOfficialNativeNotify
 {
     param([string[]]$Command, [string]$LocalRoot)
-    if ($Command.Count -ne 2 -or $Command[1] -cne "turn-ended") { return $false }
+    if ($Command.Count -lt 2 -or $Command[1] -cne "turn-ended") { return $false }
     if ([IO.Path]::GetFileName($Command[0]) -cne "codex-computer-use.exe") { return $false }
     $trustedRoot = Join-Path $LocalRoot "OpenAI\Codex\runtimes\cua_node"
     return (Test-LNPathWithinRoot $Command[0] $trustedRoot) -and
         (Test-Path -LiteralPath $Command[0] -PathType Leaf)
+}
+
+function Test-LNOfficialCodexNotify
+{
+    param([string[]]$Command, [string]$LocalRoot)
+    return $Command.Count -eq 2 -and (Test-LNOfficialNativeNotify $Command $LocalRoot)
+}
+
+function Test-LNChainedCodexNotify
+{
+    param([string[]]$Command, [string]$LocalRoot, [string]$BridgePath)
+    if ($Command.Count -ne 4 -or $Command[2] -cne "--previous-notify") { return $false }
+    if (-not (Test-LNOfficialNativeNotify $Command $LocalRoot)) { return $false }
+    try { $previous = $Command[3] | ConvertFrom-Json }
+    catch { return $false }
+    if ($null -eq $previous) { return $false }
+    return Test-LNCodexNotifyBridge ([string[]]@($previous)) $BridgePath
 }
 
 function Test-LNCodexNotifyBridge
@@ -599,9 +633,15 @@ function Update-LNTomlNotifyFile
         $hasBom = $originalBytes.Length -ge 3 -and $originalBytes[0] -eq 0xEF -and $originalBytes[1] -eq 0xBB -and $originalBytes[2] -eq 0xBF
         $text = if ($exists) { [Text.Encoding]::UTF8.GetString($originalBytes).TrimStart([char]0xFEFF) } else { "" }
         $info = Get-LNTomlNotifyInfo $text
-        if ($info.Exists -and (Test-LNCodexNotifyBridge $info.Command $BridgePath))
+        $isBridge = Test-LNCodexNotifyBridge $info.Command $BridgePath
+        $isChained = Test-LNChainedCodexNotify $info.Command $LocalRoot $BridgePath
+        if ($info.Exists -and ($isBridge -or $isChained))
         {
-            return [pscustomobject]@{ Path = $Path; Changed = $false; WouldChange = $false; Created = $false; NativeCommand = @() }
+            $nativeCommand = if ($isChained) { @($info.Command[0], $info.Command[1]) } else { @() }
+            return [pscustomobject]@{
+                Path = $Path; Changed = $false; WouldChange = $false; Created = $false
+                NativeCommand = $nativeCommand; Chained = $isChained
+            }
         }
         if ($info.Exists -and -not (Test-LNOfficialCodexNotify $info.Command $LocalRoot))
         {
@@ -626,7 +666,7 @@ function Update-LNTomlNotifyFile
         [void](Get-LNTomlNotifyInfo $candidate)
         if ($CheckOnly)
         {
-            return [pscustomobject]@{ Path = $Path; Changed = $false; WouldChange = $true; Created = -not $exists; NativeCommand = $nativeCommand }
+            return [pscustomobject]@{ Path = $Path; Changed = $false; WouldChange = $true; Created = -not $exists; NativeCommand = $nativeCommand; Chained = $false }
         }
         try
         {
@@ -650,7 +690,7 @@ function Update-LNTomlNotifyFile
                 Copy-LNAcl $Path $backupPath
             }
             else { [IO.File]::Move($tempPath, $Path) }
-            return [pscustomobject]@{ Path = $Path; Changed = $true; WouldChange = $true; Created = -not $exists; NativeCommand = $nativeCommand }
+            return [pscustomobject]@{ Path = $Path; Changed = $true; WouldChange = $true; Created = -not $exists; NativeCommand = $nativeCommand; Chained = $false }
         }
         catch
         {
@@ -669,6 +709,43 @@ function Update-LNNativeNotifyState
         if (($existing | ConvertTo-Json -Compress) -ceq ($Command | ConvertTo-Json -Compress)) { return $false }
         Set-LNProperty $document "command" @($Command)
         return $true
+    }
+}
+
+function Restore-LNTomlSnapshot
+{
+    param(
+        [string]$Path,
+        [bool]$OriginalExists,
+        [byte[]]$OriginalBytes,
+        [string]$ExpectedCurrentHash
+    )
+
+    $currentExists = Test-Path -LiteralPath $Path -PathType Leaf
+    if (-not $currentExists) { return -not $OriginalExists }
+    $currentHash = Get-LNSha256 ([IO.File]::ReadAllBytes($Path))
+    if ($currentHash -cne $ExpectedCurrentHash) { return $false }
+    if (-not $OriginalExists)
+    {
+        Remove-Item -LiteralPath $Path -Force
+        return $true
+    }
+
+    $tempPath = "$Path.lark-notify.rollback.tmp"
+    $backupPath = "$Path.lark-notify.rollback.bak"
+    try
+    {
+        [IO.File]::WriteAllBytes($tempPath, $OriginalBytes)
+        [void](Get-LNTomlNotifyInfo ([IO.File]::ReadAllText($tempPath)))
+        Copy-LNAcl $Path $tempPath
+        if (Test-Path -LiteralPath $backupPath) { Remove-Item -LiteralPath $backupPath -Force }
+        [IO.File]::Replace($tempPath, $Path, $backupPath, $true)
+        Copy-LNAcl $Path $backupPath
+        return $true
+    }
+    finally
+    {
+        if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -716,10 +793,6 @@ function Invoke-LarkNotifyBootstrap
             param($document)
             Merge-LNClaudeConfig $document $notifyScript
         }
-        $codexResult = Update-LNJsonFile -Path $codexPath -CheckOnly:$CheckOnly -BeforeReplace $BeforeReplace -Merge {
-            param($document)
-            Merge-LNCodexConfig $document $notifyScript
-        }
         $tomlPlan = Update-LNTomlNotifyFile `
             -Path $codexTomlPath `
             -BridgePath $bridgeScript `
@@ -737,6 +810,8 @@ function Invoke-LarkNotifyBootstrap
             -Command $nativeCommand `
             -CheckOnly:$CheckOnly `
             -BeforeReplace $BeforeReplace
+        $tomlBeforeExists = Test-Path -LiteralPath $codexTomlPath -PathType Leaf
+        [byte[]]$tomlBeforeBytes = if ($tomlBeforeExists) { [IO.File]::ReadAllBytes($codexTomlPath) } else { [byte[]]@() }
         $tomlResult = if ($CheckOnly) {
             $tomlPlan
         } else {
@@ -746,7 +821,40 @@ function Invoke-LarkNotifyBootstrap
                 -LocalRoot $LocalAppDataPath `
                 -BeforeReplace $BeforeReplace
         }
-        $requiresTrust = [bool]($codexResult.Changed -or $codexResult.WouldChange)
+        $tomlWrittenHash = if (-not $CheckOnly -and $tomlResult.Changed) {
+            Get-LNSha256 ([IO.File]::ReadAllBytes($codexTomlPath))
+        } else { "" }
+        $codexResult = [pscustomobject]@{ Path = $codexPath; Changed = $false; WouldChange = $false; Created = $false }
+        if (Test-Path -LiteralPath $codexPath -PathType Leaf)
+        {
+            try
+            {
+                $codexResult = Update-LNJsonFile -Path $codexPath -CheckOnly:$CheckOnly -BeforeReplace $BeforeReplace -Merge {
+                    param($document)
+                    Merge-LNCodexConfig $document $notifyScript
+                }
+            }
+            catch
+            {
+                $rollbackState = "not-required"
+                if (-not $CheckOnly -and $tomlResult.Changed)
+                {
+                    try
+                    {
+                        $rolledBack = Restore-LNTomlSnapshot `
+                            -Path $codexTomlPath `
+                            -OriginalExists $tomlBeforeExists `
+                            -OriginalBytes $tomlBeforeBytes `
+                            -ExpectedCurrentHash $tomlWrittenHash
+                        $rollbackState = if ($rolledBack) { "completed" } else { "skipped-concurrent-change" }
+                    }
+                    catch { $rollbackState = "failed: $($_.Exception.Message)" }
+                }
+                throw "Codex hook migration failed; TOML rollback=$rollbackState. $($_.Exception.Message)"
+            }
+        }
+        $requiresTrust = [bool]($codexResult.Changed -or $codexResult.WouldChange -or
+            $tomlResult.Changed -or $tomlResult.WouldChange)
         $summary = [pscustomobject][ordered]@{
             Healthy = if ($CheckOnly) {
                 -not ($claudeResult.WouldChange -or $codexResult.WouldChange -or
@@ -758,6 +866,7 @@ function Invoke-LarkNotifyBootstrap
             ClaudeChanged = [bool]$claudeResult.Changed
             CodexChanged = [bool]$codexResult.Changed
             CodexNotifyChanged = [bool]$tomlResult.Changed
+            CodexNotifyChained = [bool]$tomlResult.Chained
             NativeNotifyChanged = [bool]$nativeStateResult.Changed
             RequiresCodexTrustConfirmation = $requiresTrust
             LarkCli = $resolvedCli
@@ -765,7 +874,7 @@ function Invoke-LarkNotifyBootstrap
         Write-LNBootstrapLog $LocalAppDataPath (
             "Bootstrap complete: checkOnly=$([bool]$CheckOnly) claudeChanged=$($summary.ClaudeChanged) " +
             "codexChanged=$($summary.CodexChanged) codexNotifyChanged=$($summary.CodexNotifyChanged) " +
-            "nativeNotifyChanged=$($summary.NativeNotifyChanged) requiresCodexTrust=$requiresTrust")
+            "codexNotifyChained=$($summary.CodexNotifyChained) nativeNotifyChanged=$($summary.NativeNotifyChanged) requiresCodexTrust=$requiresTrust")
         return $summary
     }
     finally

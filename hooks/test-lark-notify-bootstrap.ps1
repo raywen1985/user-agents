@@ -112,17 +112,17 @@ try
     $first = Invoke-TestBootstrap $fresh
     Assert-True $first.Healthy "first repair reports healthy"
     Assert-True $first.ClaudeChanged "fresh Claude config changed"
-    Assert-True $first.CodexChanged "fresh Codex config changed"
+    Assert-False $first.CodexChanged "fresh profile does not create Codex hooks"
     Assert-True $first.CodexNotifyChanged "fresh Codex notify changed"
     Assert-True $first.NativeNotifyChanged "fresh native notify state changed"
-    Assert-True $first.RequiresCodexTrustConfirmation "fresh Codex config requires trust"
+    Assert-True $first.RequiresCodexTrustConfirmation "fresh Codex notify requires trust"
 
     $claudePath = Join-Path $fresh.Profile ".claude\settings.json"
     $codexPath = Join-Path $fresh.Profile ".codex\hooks.json"
     $codexTomlPath = Join-Path $fresh.Profile ".codex\config.toml"
     $nativeStatePath = Join-Path $fresh.Local "lark-notify\codex-native-notify.json"
     Assert-True (Test-Path $claudePath) "Claude config created"
-    Assert-True (Test-Path $codexPath) "Codex config created"
+    Assert-False (Test-Path $codexPath) "Codex hooks config not created"
     Assert-True (Test-Path $codexTomlPath) "Codex TOML created"
     Assert-True (Test-Path $nativeStatePath) "native notify state created"
     $tomlInfo = Get-LNTomlNotifyInfo (Get-Content -Raw $codexTomlPath)
@@ -135,17 +135,11 @@ try
         $hooks = Get-Hooks $claudePath $eventName
         Assert-Equals @(Get-SendingHooks $hooks "claude").Count 1 "Claude $eventName one send path"
     }
-    Assert-Equals @(Get-SendingHooks (Get-Hooks $codexPath "Stop") "codex").Count 1 "Codex one send path"
-    Assert-Equals `
-        (Get-SendingHooks (Get-Hooks $codexPath "Stop") "codex")[0].command `
-        "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$($fresh.Profile)\.agents\hooks\lark-notify.ps1`" -Source codex" `
-        "Codex command remains trust-stable"
     $notification = (Get-Content -Raw $claudePath | ConvertFrom-Json).hooks.Notification[0]
     Assert-Equals $notification.matcher "permission_prompt|idle_prompt|agent_needs_input" "notification matcher"
     Assert-True ([bool]$notification.hooks[0].async) "notification async"
 
     $claudeTime = (Get-Item $claudePath).LastWriteTimeUtc
-    $codexTime = (Get-Item $codexPath).LastWriteTimeUtc
     $tomlTime = (Get-Item $codexTomlPath).LastWriteTimeUtc
     $nativeStateTime = (Get-Item $nativeStatePath).LastWriteTimeUtc
     Start-Sleep -Milliseconds 1100
@@ -155,7 +149,7 @@ try
     Assert-False $second.CodexNotifyChanged "second Codex notify run idempotent"
     Assert-False $second.NativeNotifyChanged "second native notify run idempotent"
     Assert-Equals (Get-Item $claudePath).LastWriteTimeUtc.Ticks $claudeTime.Ticks "Claude timestamp unchanged"
-    Assert-Equals (Get-Item $codexPath).LastWriteTimeUtc.Ticks $codexTime.Ticks "Codex timestamp unchanged"
+    Assert-False (Test-Path $codexPath) "second run still does not create Codex hooks"
     Assert-Equals (Get-Item $codexTomlPath).LastWriteTimeUtc.Ticks $tomlTime.Ticks "Codex TOML timestamp unchanged"
     Assert-Equals (Get-Item $nativeStatePath).LastWriteTimeUtc.Ticks $nativeStateTime.Ticks "native notify state timestamp unchanged"
 
@@ -166,6 +160,32 @@ try
     Assert-False (Test-Path (Join-Path $check.Profile ".codex\hooks.json")) "check-only does not create Codex config"
     Assert-False (Test-Path (Join-Path $check.Profile ".codex\config.toml")) "check-only does not create Codex TOML"
     Assert-False (Test-Path (Join-Path $check.Local "lark-notify\codex-native-notify.json")) "check-only does not create native state"
+
+    $chained = New-TestProfile "chained"
+    [void](Invoke-TestBootstrap $chained)
+    $chainedTomlPath = Join-Path $chained.Profile ".codex\config.toml"
+    $chainedBridge = Join-Path $chained.Profile ".agents\hooks\Invoke-CodexNotifyBridge.ps1"
+    $chainedPrevious = @("powershell.exe", "-File", $chainedBridge) | ConvertTo-Json -Compress
+    $chainedLine = "notify = ['$($chained.NativeNotify)', ""turn-ended"", ""--previous-notify"", '$chainedPrevious']"
+    Set-Content -LiteralPath $chainedTomlPath -Value $chainedLine -Encoding UTF8 -NoNewline
+    $chainedTime = (Get-Item $chainedTomlPath).LastWriteTimeUtc
+    Start-Sleep -Milliseconds 1100
+    $chainedResult = Invoke-TestBootstrap $chained
+    Assert-True $chainedResult.Healthy "chained notify reports healthy"
+    Assert-True $chainedResult.CodexNotifyChained "chained notify detected"
+    Assert-False $chainedResult.CodexNotifyChanged "chained notify left untouched"
+    Assert-False $chainedResult.NativeNotifyChanged "chained native state unchanged"
+    Assert-Equals (Get-Item $chainedTomlPath).LastWriteTimeUtc.Ticks $chainedTime.Ticks "chained TOML timestamp unchanged"
+    Assert-Equals (Get-Content -Raw $chainedTomlPath).Trim() $chainedLine.Trim() "chained TOML content unchanged"
+    $chainedCheck = Invoke-TestBootstrap $chained -CheckOnly
+    Assert-True $chainedCheck.Healthy "chained check-only healthy"
+
+    $unknownChain = New-TestProfile "unknown-chain"
+    [void](Invoke-TestBootstrap $unknownChain)
+    $unknownTomlPath = Join-Path $unknownChain.Profile ".codex\config.toml"
+    $unknownLine = "notify = ['$($unknownChain.NativeNotify)', ""turn-ended"", ""--previous-notify"", '[""powershell.exe"",""-File"",""C:\\temp\\other.ps1""]']"
+    Set-Content -LiteralPath $unknownTomlPath -Value $unknownLine -Encoding UTF8 -NoNewline
+    Assert-Throws { Invoke-TestBootstrap $unknownChain } "unknown chained previous notify refused"
 
     $complex = New-TestProfile "complex"
     [IO.Directory]::CreateDirectory((Join-Path $complex.Profile ".claude")) | Out-Null
@@ -221,8 +241,10 @@ try
     Assert-Equals $complexClaude.hooks.Notification[0].hooks[1].command $unknown "notification sibling preserved"
     Assert-Equals @(Get-SendingHooks (Get-Hooks (Join-Path $complex.Profile ".claude\settings.json") "Notification") "claude").Count 1 "shared notification gets canonical entry"
     Assert-Equals $complexCodex.hooks.Stop[0].hooks[0].command $unknown "Codex unknown index preserved"
+    Assert-Equals $complexCodex.hooks.Stop[1].hooks[0].command 'powershell.exe -NoLogo -NoProfile -NonInteractive -Command "exit 0"' "first owned Codex hook disabled in place"
+    Assert-Equals $complexCodex.hooks.Stop[2].hooks[0].command 'powershell.exe -NoLogo -NoProfile -NonInteractive -Command "exit 0"' "second owned Codex hook disabled in place"
     Assert-Equals $complexCodex.description "keep me" "Codex description preserved"
-    Assert-Equals @(Get-SendingHooks (Get-Hooks (Join-Path $complex.Profile ".codex\hooks.json") "Stop") "codex").Count 1 "duplicate Codex hooks consolidated"
+    Assert-Equals @(Get-SendingHooks (Get-Hooks (Join-Path $complex.Profile ".codex\hooks.json") "Stop") "codex").Count 0 "all Codex send hooks disabled"
     Assert-Equals (Get-Acl (Join-Path $complex.Profile ".claude\settings.json")).Sddl $beforeAcl "target ACL preserved"
     Assert-Equals (Get-Acl ((Join-Path $complex.Profile ".claude\settings.json") + ".lark-notify.bootstrap.bak")).Sddl $beforeAcl "backup ACL preserved"
 
@@ -235,8 +257,49 @@ try
             }) })
         }
     }
-    Assert-False (Merge-LNCodexConfig $stableCodexDocument $notifyPath) "valid single Codex hook unchanged"
-    Assert-Equals $stableCodexDocument.hooks.Stop[0].hooks[0].command $stableCodexCommand "valid Codex command text preserved"
+    Assert-True (Merge-LNCodexConfig $stableCodexDocument $notifyPath) "single Codex hook disabled"
+    Assert-Equals $stableCodexDocument.hooks.Stop[0].hooks[0].command 'powershell.exe -NoLogo -NoProfile -NonInteractive -Command "exit 0"' "single Codex hook replaced in place"
+
+    $metadataCodexDocument = [pscustomobject][ordered]@{
+        hooks = [pscustomobject][ordered]@{
+            Stop = @([pscustomobject][ordered]@{
+                matcher = "keep-matcher"
+                custom = "keep-metadata"
+                hooks = @([pscustomobject]@{ type = "command"; command = $stableCodexCommand; timeout = 3 })
+            })
+        }
+    }
+    Assert-True (Merge-LNCodexConfig $metadataCodexDocument $notifyPath) "metadata Codex hook disabled"
+    Assert-Equals $metadataCodexDocument.hooks.Stop[0].matcher "keep-matcher" "Codex matcher preserved"
+    Assert-Equals $metadataCodexDocument.hooks.Stop[0].custom "keep-metadata" "Codex entry metadata preserved"
+
+    $rollback = New-TestProfile "rollback"
+    [IO.Directory]::CreateDirectory((Join-Path $rollback.Profile ".codex")) | Out-Null
+    $rollbackHooksPath = Join-Path $rollback.Profile ".codex\hooks.json"
+    $rollbackTomlPath = Join-Path $rollback.Profile ".codex\config.toml"
+    $rollbackNotifyPath = Join-Path $rollback.Profile ".agents\hooks\lark-notify.ps1"
+    $rollbackOwnedCommand = "powershell.exe -File `"$rollbackNotifyPath`" -Source codex"
+    [pscustomobject][ordered]@{
+        hooks = [pscustomobject][ordered]@{
+            Stop = @([pscustomobject]@{ hooks = @([pscustomobject]@{
+                type = "command"; command = $rollbackOwnedCommand; timeout = 30
+            }) })
+        }
+    } | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $rollbackHooksPath -Encoding UTF8
+    $rollbackNativeLine = "notify = " + (ConvertTo-LNTomlArray @($rollback.NativeNotify, "turn-ended"))
+    Set-Content -LiteralPath $rollbackTomlPath -Value $rollbackNativeLine -Encoding UTF8 -NoNewline
+    $script:rollbackFailureInjected = $false
+    $failHookReplace = {
+        param($path, $attempt)
+        if (-not $script:rollbackFailureInjected -and $path -eq $rollbackHooksPath)
+        {
+            $script:rollbackFailureInjected = $true
+            throw "forced hook replacement failure"
+        }
+    }
+    Assert-Throws { Invoke-TestBootstrap $rollback -BeforeReplace $failHookReplace } "hook migration failure reported"
+    Assert-Equals (Get-Content -Raw $rollbackTomlPath).Trim() $rollbackNativeLine "TOML rolled back after hook migration failure"
+    Assert-Equals @(Get-SendingHooks (Get-Hooks $rollbackHooksPath "Stop") "codex").Count 1 "old Codex hook retained after migration failure"
 
     $concurrent = New-TestProfile "concurrent"
     [IO.Directory]::CreateDirectory((Join-Path $concurrent.Profile ".claude")) | Out-Null

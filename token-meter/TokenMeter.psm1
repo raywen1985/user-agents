@@ -103,28 +103,88 @@ function ConvertTo-TMCanonicalJson {
     return ConvertTo-TMCanonicalJson $table
 }
 
-function Read-TMJsonLines {
+function Read-TMFileBytes {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [int]$Attempts = 6,
+        [int]$DelayMilliseconds = 100
+    )
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            try {
+                $memory = New-Object IO.MemoryStream
+                try {
+                    $stream.CopyTo($memory)
+                    return ,$memory.ToArray()
+                }
+                finally { $memory.Dispose() }
+            }
+            finally { $stream.Dispose() }
+        }
+        catch [IO.IOException] {
+            $lastError = $_
+            if ($attempt -lt $Attempts) { Start-Sleep -Milliseconds $DelayMilliseconds }
+        }
+    }
+    throw $lastError.Exception
+}
+
+function Read-TMFileSnapshot {
     param([Parameter(Mandatory=$true)][string]$Path)
+    $bytes = Read-TMFileBytes $Path
+    $raw = [Text.Encoding]::GetEncoding(28591).GetString($bytes)
+    return [pscustomobject]@{ Bytes = $bytes; Raw = $raw }
+}
+
+# Structural needles are ASCII, so the ISO-8859-1 view of the bytes is searchable
+# without decoding whole lines as UTF-8 first.
+function Test-TMLineSelectedRaw {
+    param([string]$Raw, [int]$Start, [int]$Count, [string[]]$ContainsAny, [string[]]$ExcludeAny)
+    if ($ContainsAny.Count -gt 0) {
+        $matched = $false
+        foreach ($needle in $ContainsAny) {
+            if ($Raw.IndexOf($needle, $Start, $Count, [StringComparison]::Ordinal) -ge 0) { $matched = $true; break }
+        }
+        if (-not $matched) { return $false }
+    }
+    foreach ($needle in $ExcludeAny) {
+        if ($Raw.IndexOf($needle, $Start, $Count, [StringComparison]::Ordinal) -ge 0) { return $false }
+    }
+    return $true
+}
+
+function Read-TMJsonLines {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [string[]]$ContainsAny = @(),
+        [string[]]$ExcludeAny = @()
+    )
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
-    $bytes = [IO.File]::ReadAllBytes($Path)
+    $snapshot = Read-TMFileSnapshot $Path
+    $bytes = $snapshot.Bytes
+    $raw = $snapshot.Raw
+    $length = $bytes.Length
     $rows = New-Object Collections.Generic.List[object]
     $start = 0
-    for ($index = 0; $index -le $bytes.Length; $index++) {
-        if ($index -lt $bytes.Length -and $bytes[$index] -ne 10) { continue }
-        $count = $index - $start
+    while ($start -lt $length) {
+        $newline = $raw.IndexOf([char]10, $start)
+        if ($newline -lt 0) { $newline = $length }
+        $count = $newline - $start
         if ($count -gt 0 -and $bytes[$start + $count - 1] -eq 13) { $count-- }
-        if ($count -gt 0) {
+        if ($count -gt 0 -and (Test-TMLineSelectedRaw $raw $start $count $ContainsAny $ExcludeAny)) {
             try {
                 $text = [Text.Encoding]::UTF8.GetString($bytes, $start, $count).TrimStart([char]0xfeff)
                 $rows.Add([pscustomobject]@{
                     Object = ($text | ConvertFrom-Json)
-                    EndOffset = [int64]([Math]::Min($index + 1, $bytes.Length))
+                    EndOffset = [int64]([Math]::Min($newline + 1, $length))
                     LineNumber = $rows.Count + 1
                 })
             }
             catch { }
         }
-        $start = $index + 1
+        $start = $newline + 1
     }
     return $rows.ToArray()
 }
@@ -150,6 +210,7 @@ function Test-TMHumanUserRow {
     $item = $Row.Object
     if ([string](Get-TMProperty $item 'type') -ne 'user') { return $false }
     if ((Get-TMProperty $item 'isSidechain') -eq $true) { return $false }
+    if ((Get-TMProperty $item 'isMeta') -eq $true) { return $false }
     $message = Get-TMProperty $item 'message'
     $content = Get-TMProperty $message 'content'
     if ($null -eq $content) { return $false }
@@ -211,15 +272,23 @@ function Get-TMPriceTablePath {
     return Join-Path $PSScriptRoot 'model-prices.json'
 }
 
-function Read-TMPriceTable {
-    param([string]$Path = (Get-TMPriceTablePath))
+function Get-TMLocalPriceTablePath {
+    param([string]$BasePath = (Get-TMPriceTablePath))
+    if (-not [string]::IsNullOrWhiteSpace($env:TOKEN_METER_LOCAL_PRICE_TABLE_PATH)) {
+        return [IO.Path]::GetFullPath($env:TOKEN_METER_LOCAL_PRICE_TABLE_PATH)
+    }
+    return Join-Path (Split-Path -Parent $BasePath) 'model-prices.local.json'
+}
+
+function Read-TMValidatedPriceTable {
+    param([Parameter(Mandatory=$true)][string]$Path, [switch]$AllowEmptyModels)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Price table not found: $Path" }
     $table = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
     if ((ConvertTo-TMInt64 (Get-TMProperty $table 'schema_version')) -ne 1) { throw 'Unsupported price table schema_version.' }
     if ([string](Get-TMProperty $table 'currency') -cne 'USD') { throw 'Price table currency must be USD.' }
     if ((ConvertTo-TMInt64 (Get-TMProperty $table 'unit_tokens')) -ne 1000000) { throw 'Price table unit_tokens must be 1000000.' }
     $models = @(Get-TMProperty $table 'models')
-    if ($models.Count -eq 0) { throw 'Price table has no models.' }
+    if ($models.Count -eq 0 -and -not $AllowEmptyModels) { throw 'Price table has no models.' }
     foreach ($model in $models) {
         if ([string]::IsNullOrWhiteSpace([string](Get-TMProperty $model 'id'))) { throw 'Price table model id is missing.' }
         foreach ($pattern in @(Get-TMProperty $model 'aliases_regex')) {
@@ -235,6 +304,50 @@ function Read-TMPriceTable {
                 [void](ConvertTo-TMPriceDecimal (Get-TMProperty $periodRates $field) "$($model.id).$period.$field")
             }
         }
+    }
+    return $table
+}
+
+function Merge-TMPriceTable {
+    param([object]$Base, [object]$Overlay)
+    $models = New-Object Collections.Generic.List[object]
+    $index = @{}
+    foreach ($model in @(Get-TMProperty $Base 'models')) {
+        $id = [string](Get-TMProperty $model 'id')
+        if (-not [string]::IsNullOrWhiteSpace($id)) { $index[$id] = $models.Count }
+        $models.Add($model)
+    }
+    foreach ($model in @(Get-TMProperty $Overlay 'models')) {
+        $id = [string](Get-TMProperty $model 'id')
+        if (-not [string]::IsNullOrWhiteSpace($id) -and $index.ContainsKey($id)) {
+            $models[$index[$id]] = $model
+        } else {
+            if (-not [string]::IsNullOrWhiteSpace($id)) { $index[$id] = $models.Count }
+            $models.Add($model)
+        }
+    }
+    $merged = [ordered]@{
+        schema_version = Get-TMProperty $Base 'schema_version'
+        currency = Get-TMProperty $Base 'currency'
+        unit_tokens = Get-TMProperty $Base 'unit_tokens'
+        source_url = Get-TMProperty $Base 'source_url'
+        verified_on = Get-TMProperty $Base 'verified_on'
+        models = $models.ToArray()
+    }
+    $localSource = [string](Get-TMProperty $Overlay 'source_url')
+    if (-not [string]::IsNullOrWhiteSpace($localSource)) { $merged['local_source_url'] = $localSource }
+    $localVerified = [string](Get-TMProperty $Overlay 'verified_on')
+    if (-not [string]::IsNullOrWhiteSpace($localVerified)) { $merged['local_verified_on'] = $localVerified }
+    return [pscustomobject]$merged
+}
+
+function Read-TMPriceTable {
+    param([string]$Path = (Get-TMPriceTablePath))
+    $table = Read-TMValidatedPriceTable $Path
+    $localPath = Get-TMLocalPriceTablePath $Path
+    if (-not [string]::IsNullOrWhiteSpace($localPath) -and (Test-Path -LiteralPath $localPath -PathType Leaf)) {
+        $overlay = Read-TMValidatedPriceTable $localPath -AllowEmptyModels
+        $table = Merge-TMPriceTable $table $overlay
     }
     return $table
 }
@@ -336,10 +449,15 @@ function Get-TMEstimatedCost {
         if ($segmentFresh -ne $fresh -or $segmentCacheRead -ne $cacheRead -or $segmentCacheWrite -ne $cacheWrite -or $segmentOutput -ne $output) {
             return New-TMUnavailableCost 'invalid_usage' $rawModels
         }
+        $priceTableSnapshot = [ordered]@{schema_version=1;source_url=[string](Get-TMProperty $table 'source_url');verified_on=[string](Get-TMProperty $table 'verified_on')}
+        $localVerified = [string](Get-TMProperty $table 'local_verified_on')
+        if (-not [string]::IsNullOrWhiteSpace($localVerified)) { $priceTableSnapshot['local_verified_on'] = $localVerified }
+        $localSource = [string](Get-TMProperty $table 'local_source_url')
+        if (-not [string]::IsNullOrWhiteSpace($localSource)) { $priceTableSnapshot['local_source_url'] = $localSource }
         return [ordered]@{
             status='estimated';reason=$null;approximate=$true;currency='USD';total_usd=(ConvertTo-TMDecimalString ($freshCost+$cacheReadCost+$cacheWriteCost+$outputCost))
             components_usd=[ordered]@{fresh_input=(ConvertTo-TMDecimalString $freshCost);cache_read=(ConvertTo-TMDecimalString $cacheReadCost);cache_write=(ConvertTo-TMDecimalString $cacheWriteCost);output=(ConvertTo-TMDecimalString $outputCost)}
-            price_table=[ordered]@{schema_version=1;source_url=[string](Get-TMProperty $table 'source_url');verified_on=[string](Get-TMProperty $table 'verified_on')}
+            price_table=$priceTableSnapshot
             raw_models=@($rawModels | Select-Object -Unique);segments=$pricedSegments.ToArray()
         }
     }
@@ -370,11 +488,33 @@ function Get-ClaudeTurnRecord {
     $parserFallbackUtc = [DateTimeOffset]::UtcNow.ToString('o')
     $sessionId = [string](Get-TMProperty $HookPayload 'session_id')
     $transcript = [string](Get-TMProperty $HookPayload 'transcript_path')
-    if ([string]::IsNullOrWhiteSpace($sessionId) -or -not (Test-Path -LiteralPath $transcript -PathType Leaf)) { throw 'Claude hook payload is missing a valid session_id or transcript_path.' }
-    $rows = @(Read-TMJsonLines $transcript)
+    if ([string]::IsNullOrWhiteSpace($sessionId) -or [string]::IsNullOrWhiteSpace($transcript) -or -not (Test-Path -LiteralPath $transcript -PathType Leaf)) { throw 'Claude hook payload is missing a valid session_id or transcript_path.' }
+    $snapshot = Read-TMFileSnapshot $transcript
+    $bytes = $snapshot.Bytes
+    $raw = $snapshot.Raw
     $userRow = $null
-    foreach ($row in $rows) { if (Test-TMHumanUserRow $row) { $userRow = $row } }
+    $turnRows = New-Object Collections.Generic.List[object]
+    $position = $bytes.Length
+    while ($position -gt 0) {
+        $lineOffset = $position
+        $lineEnd = $position
+        if ($lineEnd -gt 0 -and $bytes[$lineEnd - 1] -eq 10) { $lineEnd-- }
+        if ($lineEnd -gt 0 -and $bytes[$lineEnd - 1] -eq 13) { $lineEnd-- }
+        $lineStart = if ($lineEnd -gt 0) { $raw.LastIndexOf([char]10, $lineEnd - 1) + 1 } else { 0 }
+        $count = $lineEnd - $lineStart
+        if ($count -gt 0 -and (Test-TMLineSelectedRaw $raw $lineStart $count @('"type":"user"', '"type": "user"', '"type":"assistant"', '"type": "assistant"') @('"type":"tool_result"', '"type": "tool_result"'))) {
+            try {
+                $item = ([Text.Encoding]::UTF8.GetString($bytes, $lineStart, $count).TrimStart([char]0xfeff) | ConvertFrom-Json)
+                $row = [pscustomobject]@{ Object=$item; EndOffset=[int64]$lineOffset; LineNumber=0 }
+                if (Test-TMHumanUserRow $row) { $userRow = $row; break }
+                if ([string](Get-TMProperty $item 'type') -eq 'assistant' -and (Get-TMProperty $item 'isSidechain') -ne $true) { $turnRows.Add($row) }
+            }
+            catch { }
+        }
+        $position = $lineStart
+    }
     if ($null -eq $userRow) { throw 'No top-level human user turn was found.' }
+    $rows = @($turnRows | Sort-Object EndOffset)
     $user = $userRow.Object
     $turnId = [string](Get-TMProperty $user 'uuid')
     if ([string]::IsNullOrWhiteSpace($turnId)) {
@@ -384,9 +524,7 @@ function Get-ClaudeTurnRecord {
     $visibleOutput = ''
     $sourceCursor = [int64]$userRow.EndOffset
     foreach ($row in $rows) {
-        if ($row.EndOffset -le $userRow.EndOffset) { continue }
         $item = $row.Object
-        if ([string](Get-TMProperty $item 'type') -ne 'assistant' -or (Get-TMProperty $item 'isSidechain') -eq $true) { continue }
         $message = Get-TMProperty $item 'message'
         if ($null -eq $message) { continue }
         $id = [string](Get-TMProperty $message 'id')
@@ -401,7 +539,7 @@ function Get-ClaudeTurnRecord {
     }
     $paths = Get-TMPaths
     if ($usageItems.Count -gt 0) {
-        [int64]$inputTokens = 0; [int64]$cacheRead = 0; [int64]$cacheWrite = 0; [int64]$output = 0
+        [int64]$inputTokens = 0; [int64]$cacheRead = 0; [int64]$cacheWrite = 0; [int64]$output = 0; [int64]$reasoning = 0
         $model = ''
         $pricingSegments = New-Object Collections.Generic.List[object]
         foreach ($entry in $usageItems) {
@@ -410,12 +548,15 @@ function Get-ClaudeTurnRecord {
             [int64]$entryCacheRead = ConvertTo-TMInt64 (Get-TMProperty $usage 'cache_read_input_tokens')
             [int64]$entryCacheWrite = ConvertTo-TMInt64 (Get-TMProperty $usage 'cache_creation_input_tokens')
             [int64]$entryOutput = ConvertTo-TMInt64 (Get-TMProperty $usage 'output_tokens')
+            [int64]$entryReasoning = ConvertTo-TMInt64 (Get-TMProperty (Get-TMProperty $usage 'output_tokens_details') 'thinking_tokens')
             $inputTokens += $entryInput
             $cacheRead += $entryCacheRead
             $cacheWrite += $entryCacheWrite
             $output += $entryOutput
+            if ($entryReasoning -gt 0) { $reasoning += $entryReasoning }
+            if (($entryInput + $entryCacheRead + $entryCacheWrite + $entryOutput) -le 0) { continue }
             $candidateModel = [string](Get-TMProperty $entry.Message 'model')
-            if (-not [string]::IsNullOrWhiteSpace($candidateModel)) { $model = $candidateModel }
+            if (-not [string]::IsNullOrWhiteSpace($candidateModel) -and $candidateModel -ne '<synthetic>') { $model = $candidateModel }
             $pricingTime = Get-TMPricingTimestamp $entry.Timestamp 'assistant_row_timestamp' (Get-TMProperty $user 'timestamp') 'human_row_timestamp' $parserFallbackUtc
             $pricingSegments.Add([pscustomobject][ordered]@{
                 raw_model=$candidateModel;timestamp_utc=$pricingTime.timestamp_utc;timestamp_source=$pricingTime.source;is_fallback=$pricingTime.is_fallback
@@ -427,8 +568,8 @@ function Get-ClaudeTurnRecord {
             session_id=$sessionId; turn_id=$turnId; model=$model; source_cursor=$sourceCursor
             quality='DERIVED_REPORTED'; source='claude.transcript.message.usage'
             source_usage=[ordered]@{input_tokens=$inputTokens;cache_read_input_tokens=$cacheRead;cache_creation_input_tokens=$cacheWrite;output_tokens=$output}
-            normalized_usage=[ordered]@{fresh_input_tokens=$inputTokens;cache_read_tokens=$cacheRead;cache_write_tokens=$cacheWrite;effective_input_tokens=($inputTokens+$cacheRead+$cacheWrite);visible_output_tokens=$output;reasoning_output_tokens=$null;generated_output_tokens=$output}
-            semantics=[ordered]@{source_input_includes_cache=$false;source_output_includes_reasoning=$false}
+            normalized_usage=[ordered]@{fresh_input_tokens=$inputTokens;cache_read_tokens=$cacheRead;cache_write_tokens=$cacheWrite;effective_input_tokens=($inputTokens+$cacheRead+$cacheWrite);visible_output_tokens=[Math]::Max([int64]0, $output - $reasoning);reasoning_output_tokens=$reasoning;generated_output_tokens=$output}
+            semantics=[ordered]@{source_input_includes_cache=$false;source_output_includes_reasoning=$true}
             pricing_segments=$pricingSegments.ToArray()
         }
     }
@@ -443,20 +584,39 @@ function Get-ClaudeTurnRecord {
     }
 }
 
+function Test-TMCodexSessionEligible {
+    param([object]$SessionMetaPayload)
+    if ($null -eq $SessionMetaPayload) { return $true }
+    if ($null -ne (Get-TMProperty $SessionMetaPayload 'parent_thread_id')) { return $false }
+    $threadSource = [string](Get-TMProperty $SessionMetaPayload 'thread_source')
+    if (-not [string]::IsNullOrWhiteSpace($threadSource) -and $threadSource -cne 'user') { return $false }
+    $source = Get-TMProperty $SessionMetaPayload 'source'
+    if ($source -is [string]) {
+        $normalized = $source.Trim().ToLowerInvariant()
+        if ($normalized -notin @('cli','exec','vscode','desktop','app','ide')) { return $false }
+    }
+    return $true
+}
+
 function Get-CodexTurnRecord {
     param([Parameter(Mandatory=$true)][object]$HookPayload)
     $parserFallbackUtc = [DateTimeOffset]::UtcNow.ToString('o')
     $sessionId = [string](Get-TMProperty $HookPayload 'session_id')
     $turnId = [string](Get-TMProperty $HookPayload 'turn_id')
     $transcript = [string](Get-TMProperty $HookPayload 'transcript_path')
-    if ([string]::IsNullOrWhiteSpace($sessionId) -or [string]::IsNullOrWhiteSpace($turnId) -or -not (Test-Path -LiteralPath $transcript -PathType Leaf)) { throw 'Codex hook payload is missing a valid session_id, turn_id, or transcript_path.' }
-    $rows = @(Read-TMJsonLines $transcript)
+    if ([string]::IsNullOrWhiteSpace($sessionId) -or [string]::IsNullOrWhiteSpace($turnId) -or [string]::IsNullOrWhiteSpace($transcript) -or -not (Test-Path -LiteralPath $transcript -PathType Leaf)) { throw 'Codex hook payload is missing a valid session_id, turn_id, or transcript_path.' }
+    $rows = @(Read-TMJsonLines $transcript -ContainsAny @('"type":"session_meta"', '"type": "session_meta"', $turnId))
+    $paths = Get-TMPaths
     $meta = $rows | Where-Object { [string](Get-TMProperty $_.Object 'type') -eq 'session_meta' } | Select-Object -First 1
-    if($null -ne $meta){
-        $metaPayload=Get-TMProperty $meta.Object 'payload';$source=Get-TMProperty $metaPayload 'source';$originator=[string](Get-TMProperty $metaPayload 'originator')
-        if($null -ne (Get-TMProperty $metaPayload 'parent_thread_id')){throw 'Nested Codex sessions are excluded.'}
-        if($source -is [string] -and $source -notin @('cli','exec')){throw 'This Codex session is not a CLI/exec session.'}
-        if($originator -match 'Desktop|IDE'){throw 'Desktop and IDE sessions are excluded.'}
+    if ($null -ne $meta) {
+        $metaPayload = Get-TMProperty $meta.Object 'payload'
+        if (-not (Test-TMCodexSessionEligible $metaPayload)) {
+            return [ordered]@{
+                cli='codex';computer=$paths.Computer;user=$paths.User;computer_scope=$paths.ComputerScope;user_scope=$paths.UserScope
+                session_id=$sessionId;turn_id=$turnId;model='';source_cursor=[int64]0;quality='EXCLUDED';source='codex.transcript'
+                source_usage=$null;normalized_usage=$null;semantics=$null;unavailable_reason='Nested subagent and non-user Codex threads are excluded.'
+            }
+        }
     }
     $matches = New-Object Collections.Generic.List[object]
     [int64]$turnCursor = 0
@@ -477,7 +637,6 @@ function Get-CodexTurnRecord {
             $matches.Add([pscustomobject]@{ Usage=(Get-TMProperty $payload 'turn_token_usage'); Cursor=$ordinal; Payload=$payload; Timestamp=(Get-TMProperty $item 'timestamp') })
         }
     }
-    $paths = Get-TMPaths
     if ($matches.Count -eq 0) {
         return [ordered]@{
             cli='codex';computer=$paths.Computer;user=$paths.User;computer_scope=$paths.ComputerScope;user_scope=$paths.UserScope
@@ -636,6 +795,10 @@ function Format-TMTurnSummary {
             }
         } else {
             $reason = if ($null -eq $cost) { 'not recorded' } else { ([string](Get-TMProperty $cost 'reason')).Replace('_',' ') }
+            if ($null -ne $cost -and $reason -eq 'model not mapped') {
+                $unmapped = @(Get-TMProperty $cost 'raw_models' | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)
+                if ($unmapped.Count -gt 0) { $reason = $reason + ' (' + ($unmapped -join ', ') + ')' }
+            }
             if (-not [string]::IsNullOrWhiteSpace($reason)) { $costDetail = $reason }
         }
         if ($Compact) { return '[TURN] in {0} | out {1} | cache {2} | cost ~{3}' -f (Format-TMInteger $effective),(Format-TMInteger $output),$ratioText,$costText.Replace(' USD','') }
@@ -674,4 +837,4 @@ function Get-TMLatestRecords {
     return @($latest.Values)
 }
 
-Export-ModuleMember -Function Get-TMProperty,Get-TMHash,Get-TMPaths,Initialize-TMDataDirectory,Write-TMError,Read-TMJsonLines,Get-ClaudeTurnRecord,Get-CodexTurnRecord,Save-TMTurnRecord,Format-TMTurnSummary,Get-TMLatestRecords,Write-TMAtomicJson,ConvertTo-TMCanonicalJson,Read-TMPriceTable,Resolve-TMPriceModel,Get-TMRatePeriod,Get-TMEstimatedCost
+Export-ModuleMember -Function Get-TMProperty,Get-TMHash,Get-TMPaths,Initialize-TMDataDirectory,Write-TMError,Read-TMJsonLines,Get-ClaudeTurnRecord,Get-CodexTurnRecord,Test-TMCodexSessionEligible,Save-TMTurnRecord,Format-TMTurnSummary,Get-TMLatestRecords,Write-TMAtomicJson,ConvertTo-TMCanonicalJson,Read-TMPriceTable,Resolve-TMPriceModel,Get-TMRatePeriod,Get-TMEstimatedCost

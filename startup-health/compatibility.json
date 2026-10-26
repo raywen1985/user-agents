@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "matrixVersion": "2026-10-25.1",
+  "runtimes": {
+    "claude": [
+      {
+        "version": "2.1.252 (Claude Code)"
+      }
+    ],
+    "codex": [
+      {
+        "version": "codex-cli 0.153.4"
+      }
+    ],
+    "desktop": [
+      {
+        "version": "codex-cli 0.163.0-alpha.10.2",
+        "internalBuild": "26.1013.40934"
+      }
+    ]
+  }
+}

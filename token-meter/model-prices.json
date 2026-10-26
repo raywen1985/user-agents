@@ -12,10 +12,13 @@
       "aliases_exact": [
         "deepseekv4flash",
         "deepseek-flash",
-        "deepseek-v4-flash"
+        "deepseek-v4-flash",
+        "deepseek-v4.1-flash",
+        "cc-deepseek-v4.1-flash",
+        "cc-deepseek-v4-1-flash"
       ],
       "aliases_regex": [
-        "^deepseek-v4-1-flash(?:-[0-9]{6})?$"
+        "^(?:cc-)?deepseek-v4[.-]1-flash(?:-[0-9]{6})?$"
       ],
       "rates": {
         "off_peak": {
@@ -39,10 +42,14 @@
       "display_name": "DeepSeek V4 Pro",
       "aliases_exact": [
         "deepseekv4pro",
-        "deepseek-v4-pro"
+        "deepseek-v4-pro",
+        "deepseek-v4.1-pro",
+        "cc-deepseek-v4-pro",
+        "cc-deepseek-v4.1-pro"
       ],
       "aliases_regex": [
-        "^deepseek-v4-pro(?:-[0-9]{4})?$"
+        "^deepseek-v4-pro(?:-[0-9]{4})?$",
+        "^(?:cc-)?deepseek-v4[.-]1-pro(?:-[0-9]{4,6})?$"
       ],
       "rates": {
         "off_peak": {

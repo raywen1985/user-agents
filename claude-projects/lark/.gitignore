@@ -1,0 +1,8 @@
+data/
+logs/
+run/
+config/*.local.json
+.claude/settings.local.json
+.claude/install-state.local.json
+*.sqlite-shm
+*.sqlite-wal

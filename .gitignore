@@ -20,14 +20,18 @@
 # Machine-local overrides
 /local/
 /lark-notify.local.json
-/lark-claude/config/*.local.json
+/claude-projects/lark/config/*.local.json
+**/.claude/settings.local.json
+/claude-projects/lark/.claude/install-state.local.json
 
 # Generated design and implementation planning artifacts at any depth
-**/docs/superpowers/
+**/superpowers/plans/
+**/superpowers/specs/
 
 # Runtime state
 /.tmp/
 /.token-meter-data/
+/token-meter/model-prices.local.json
 /lark-auth-qr.png
 /skills/*-workspace/
 *.log
@@ -46,9 +50,9 @@
 *.sqlite3-shm
 *.sqlite3-wal
 *.sqlite3-journal
-/lark-claude/data/
-/lark-claude/logs/
-/lark-claude/run/
+/claude-projects/lark/data/
+/claude-projects/lark/logs/
+/claude-projects/lark/run/
 
 # Node.js dependencies and caches
 node_modules/
@@ -122,9 +126,9 @@ $RECYCLE.BIN/
 *.rej
 *~
 
-# Intentionally track the real deployment configs below. This private repo
-# must still be checked for credentials before commits:
+# Intentionally track only portable base configuration below. Machine paths
+# belong in the ignored *.local.json files generated during installation:
 # - /lark-notify.json
-# - /lark-claude/config/gateway.json
-# - /lark-claude/config/projects.json
+# - /claude-projects/lark/config/gateway.json
+# - /claude-projects/lark/config/projects.json
 

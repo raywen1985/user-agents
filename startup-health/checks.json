@@ -1,0 +1,194 @@
+{
+  "schemaVersion": 1,
+  "checks": [
+    {
+      "id": "runtime-dependencies",
+      "title": "Runtime dependencies",
+      "script": "checks/runtime-dependencies.ps1",
+      "clients": ["claude", "codex", "desktop"],
+      "scope": "global",
+      "enabled": true,
+      "autoStartPolicy": null,
+      "checkTimeoutMs": 3000,
+      "freshnessSeconds": 300,
+      "cooldownSeconds": 0,
+      "dependsOn": [],
+      "reasons": {
+        "dependencies-ready": "Required local runtimes are available.",
+        "dependency-missing": "A required local runtime is unavailable.",
+        "dependency-version-unavailable": "A runtime version could not be verified."
+      },
+      "guidance": {
+        "review-runtime-installation": {
+          "text": "Review the local runtime installation and run the explicit feature installer.",
+          "documentation": "startup-health/README.md#runtime-dependencies"
+        }
+      }
+    },
+    {
+      "id": "config-integrity",
+      "title": "Client configuration integrity",
+      "script": "checks/config-integrity.ps1",
+      "clients": ["claude", "codex", "desktop"],
+      "scope": "surface",
+      "enabled": true,
+      "autoStartPolicy": null,
+      "checkTimeoutMs": 2500,
+      "freshnessSeconds": 300,
+      "cooldownSeconds": 0,
+      "dependsOn": ["runtime-dependencies"],
+      "reasons": {
+        "configuration-valid": "Client configuration is valid.",
+        "configuration-invalid": "Client configuration could not be validated.",
+        "owned-hook-duplicate": "A managed hook appears more than once.",
+        "validator-unavailable": "The client configuration validator is unavailable."
+      },
+      "guidance": {
+        "review-client-configuration": {
+          "text": "Review the client configuration and rerun the startup-health installer.",
+          "documentation": "startup-health/README.md#configuration-integrity"
+        }
+      }
+    },
+    {
+      "id": "token-meter",
+      "title": "Per-turn token meter",
+      "script": "checks/token-meter.ps1",
+      "clients": ["claude", "codex", "desktop"],
+      "scope": "surface",
+      "enabled": true,
+      "autoStartPolicy": null,
+      "checkTimeoutMs": 2000,
+      "freshnessSeconds": 300,
+      "cooldownSeconds": 0,
+      "dependsOn": ["runtime-dependencies", "config-integrity"],
+      "reasons": {
+        "token-meter-ready": "Per-turn token metering is configured.",
+        "token-meter-component-missing": "A token-meter component is missing.",
+        "token-meter-hook-missing": "The token-meter hook is missing or drifted.",
+        "token-meter-data-denied": "The token-meter data directory is not writable by the current user.",
+        "token-meter-manifest-invalid": "The token-meter install manifest is invalid."
+      },
+      "guidance": {
+        "run-token-meter-installer": {
+          "text": "Run the Token Meter installer after reviewing the reported drift.",
+          "documentation": "token-meter/README.md"
+        }
+      }
+    },
+    {
+      "id": "lark-notify",
+      "title": "Feishu notifications",
+      "script": "checks/lark-notify.ps1",
+      "clients": ["claude", "codex", "desktop"],
+      "scope": "surface",
+      "enabled": true,
+      "autoStartPolicy": null,
+      "checkTimeoutMs": 3000,
+      "freshnessSeconds": 300,
+      "cooldownSeconds": 0,
+      "dependsOn": ["runtime-dependencies", "config-integrity"],
+      "reasons": {
+        "notification-ready": "Feishu notification integration is configured.",
+        "notification-component-missing": "A Feishu notification component is missing.",
+        "notification-hook-missing": "The Feishu notification hook is missing or drifted.",
+        "bootstrap-task-missing": "The Feishu notification bootstrap task is missing.",
+        "bootstrap-task-disabled": "The Feishu notification bootstrap task is disabled.",
+        "bootstrap-last-run-failed": "The Feishu notification bootstrap last completed with an error."
+      },
+      "guidance": {
+        "run-notification-installer": {
+          "text": "Run the explicit Feishu notification bootstrap installer.",
+          "documentation": "hooks/Install-LarkNotifyBootstrapTask.ps1"
+        }
+      }
+    },
+    {
+      "id": "lark-gateway",
+      "title": "Feishu remote gateway",
+      "script": "checks/lark-gateway.ps1",
+      "clients": ["claude", "codex", "desktop"],
+      "scope": "global",
+      "enabled": true,
+      "autoStartPolicy": "lark-gateway-task-v1",
+      "checkTimeoutMs": 3000,
+      "freshnessSeconds": 60,
+      "cooldownSeconds": 300,
+      "dependsOn": ["runtime-dependencies"],
+      "reasons": {
+        "listener-ready": "Feishu remote gateway is ready.",
+        "live-gateway-external-to-task": "A validated gateway is running outside the scheduled task.",
+        "gateway-not-running": "The Feishu remote gateway is not running.",
+        "gateway-health-invalid": "The Feishu remote gateway health document is invalid.",
+        "gateway-health-stale": "The Feishu remote gateway health document is stale.",
+        "gateway-start-timeout": "The Feishu remote gateway did not become ready in time.",
+        "gateway-task-exited": "The Feishu remote gateway task exited before becoming ready.",
+        "gateway-task-disabled": "The Feishu remote gateway task is disabled.",
+        "gateway-task-missing": "The Feishu remote gateway task is missing.",
+        "policy-task-definition-drift": "Gateway task definition no longer matches the approved auto-start policy."
+      },
+      "guidance": {
+        "reinstall-health-policy": {
+          "text": "Re-run the startup-health installer after reviewing the gateway task change.",
+          "documentation": "startup-health/README.md#task-definition-drift"
+        },
+        "run-gateway-installer": {
+          "text": "Run the explicit Feishu gateway installer.",
+          "documentation": "claude-projects/lark/scripts/install-task.ps1"
+        }
+      }
+    },
+    {
+      "id": "chrome-devtools-mcp",
+      "title": "Chrome DevTools MCP",
+      "script": "checks/chrome-devtools-mcp.ps1",
+      "clients": ["claude", "codex", "desktop"],
+      "scope": "surface",
+      "enabled": true,
+      "autoStartPolicy": null,
+      "checkTimeoutMs": 3000,
+      "freshnessSeconds": 300,
+      "cooldownSeconds": 0,
+      "dependsOn": ["runtime-dependencies", "config-integrity"],
+      "reasons": {
+        "chrome-devtools-ready": "Chrome DevTools MCP is configured.",
+        "chrome-devtools-package-missing": "The pinned Chrome DevTools MCP package is unavailable.",
+        "chrome-devtools-config-missing": "Chrome DevTools MCP is not configured for this client.",
+        "chrome-devtools-config-drift": "Chrome DevTools MCP configuration differs from the pinned installation.",
+        "chrome-unavailable": "Chrome is unavailable for automatic connection.",
+        "remote-debugging-unavailable": "Chrome remote debugging is unavailable."
+      },
+      "guidance": {
+        "review-chrome-devtools-setup": {
+          "text": "Review the Chrome DevTools MCP and Chrome remote-debugging setup.",
+          "documentation": "startup-health/README.md#chrome-devtools-mcp"
+        }
+      }
+    },
+    {
+      "id": "model-proxy",
+      "title": "Local model proxy",
+      "script": "checks/model-proxy.ps1",
+      "clients": ["claude", "codex", "desktop"],
+      "scope": "surface",
+      "enabled": true,
+      "autoStartPolicy": null,
+      "checkTimeoutMs": 2000,
+      "freshnessSeconds": 300,
+      "cooldownSeconds": 0,
+      "dependsOn": ["config-integrity"],
+      "reasons": {
+        "model-proxy-ready": "The configured local model proxy is reachable.",
+        "model-proxy-unconfigured": "No local model proxy endpoint is configured.",
+        "model-proxy-unreachable": "The configured local model proxy is unavailable.",
+        "model-proxy-not-loopback": "The configured model proxy is not a loopback endpoint."
+      },
+      "guidance": {
+        "review-model-proxy": {
+          "text": "Review the local model proxy service and client endpoint configuration.",
+          "documentation": "startup-health/README.md#local-model-proxy"
+        }
+      }
+    }
+  ]
+}

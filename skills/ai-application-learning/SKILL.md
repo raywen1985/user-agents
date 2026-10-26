@@ -13,7 +13,7 @@ description: "面向资深程序员的个人 AI 应用学习与实践能力。�
 
 1. 检查调用环境是否显式提供 `AGENTS_ROOT`；若有，解析为绝对路径。
 2. 否则使用操作系统解析出的用户主目录并追加 `.agents`。Windows 优先使用 `$env:USERPROFILE`，其他环境使用等价的用户主目录 API。
-3. 验证根目录同时包含 `study-claude/README.md` 和 `skills/ai-application-learning/SKILL.md`。
+3. 验证根目录同时包含 `claude-projects/study/README.md` 和 `skills/ai-application-learning/SKILL.md`。
 4. 验证失败时停止读取和写入，清楚报告尝试过的候选路径及如何设置 `AGENTS_ROOT`。不要扫描整块磁盘或猜测其他目录。
 
 后文路径均相对于已验证的 `.agents` 根目录。
@@ -33,7 +33,7 @@ description: "面向资深程序员的个人 AI 应用学习与实践能力。�
 
 ## 按需读取资料
 
-先完成范围判定；如果请求属于前述排除项，立即退出本 Skill，不读取画像、路线或进度。确认属于本 Skill 后，始终先读 `study-claude/profiles/learner.md`，然后只读取主模式需要的资料：
+先完成范围判定；如果请求属于前述排除项，立即退出本 Skill，不读取画像、路线或进度。确认属于本 Skill 后，始终先读 `claude-projects/study/profiles/learner.md`，然后只读取主模式需要的资料：
 
 - `daily`：`roadmap/ai-application-roadmap.md`、`state/progress.json`、`templates/daily-session.md`，以及相关 track。
 - `concept`：路线中相关单元和相关 track；需要 30 分钟结构时再读每日模板。
@@ -106,8 +106,8 @@ description: "面向资深程序员的个人 AI 应用学习与实践能力。�
 写入前对内容分类：
 
 - 儿童信息、未公开工作内容、公司或项目标识、内部代码、健康或财务信息属于私密内容。
-- 私密内容只写入 `study-claude/notes/private/` 或不落盘。
-- 可跟踪的 `study-claude/notes/` 只保存脱敏知识总结。
+- 私密内容只写入 `claude-projects/study/notes/private/` 或不落盘。
+- 可跟踪的 `claude-projects/study/notes/` 只保存脱敏知识总结。
 - 无法确定是否敏感时按私密处理，并告诉用户保存位置与原因。
 
 高影响的健康、财务、法律和教育判断需要说明 AI 局限、信息日期与人工核验步骤。
@@ -116,7 +116,7 @@ description: "面向资深程序员的个人 AI 应用学习与实践能力。�
 
 生成或展示内容本身不授权写入。只有用户明确说“完成”“学完了”“记录本次”“保存学习记录”或等价表达时才保存。
 
-保存时读取 `study-claude/templates/reflection.md` 和 `study-claude/notes/README.md`，并遵循：
+保存时读取 `claude-projects/study/templates/reflection.md` 和 `claude-projects/study/notes/README.md`，并遵循：
 
 1. 创建稳定 `session_id`：`YYYY-MM-DD-<roadmap-unit>-<topic-slug>`。
 2. 先查找相同 `session_id`；存在则更新原记录，不新建副本。

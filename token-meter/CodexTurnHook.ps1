@@ -5,11 +5,16 @@ Import-Module (Join-Path $PSScriptRoot 'TokenMeter.psm1') -Force
 try {
     $payload = [Console]::In.ReadToEnd() | ConvertFrom-Json
     $deadline = [DateTime]::UtcNow.AddMilliseconds(1500)
+    $record = $null
+    $lastError = $null
     do {
-        $record = Get-CodexTurnRecord $payload
-        if ($record.quality -ne 'UNAVAILABLE') { break }
+        try { $record = Get-CodexTurnRecord $payload; $lastError = $null }
+        catch { $record = $null; $lastError = $_.Exception.Message }
+        if ($null -ne $record -and $record.quality -ne 'UNAVAILABLE') { break }
         Start-Sleep -Milliseconds 75
     } while ([DateTime]::UtcNow -lt $deadline)
+    if ($null -ne $record -and $record.quality -eq 'EXCLUDED') { exit 0 }
+    if ($null -eq $record) { if (-not [string]::IsNullOrWhiteSpace($lastError)) { throw $lastError } else { throw 'Codex transcript could not be read before the hook deadline.' } }
     $result = Save-TMTurnRecord $record
     $paths = Initialize-TMDataDirectory
     Write-TMAtomicJson (Join-Path $paths.DataRoot 'hook-invoked-codex.json') ([ordered]@{cli='codex';state='hook_invoked';timestamp=[DateTimeOffset]::Now.ToString('o')})

@@ -1,0 +1,12 @@
+{
+  "name": "ai-startup-health-config-editor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test config-editor.test.mjs"
+  },
+  "dependencies": {
+    "jsonc-parser": "3.3.1"
+  }
+}

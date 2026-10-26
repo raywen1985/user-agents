@@ -140,22 +140,6 @@ function Find-CNBSessionEvidence
             }
         }
     }
-    $sessionsRoot = Join-Path $CodexHome "sessions"
-    if (Test-Path -LiteralPath $sessionsRoot -PathType Container)
-    {
-        try
-        {
-            $match = Get-ChildItem -LiteralPath $sessionsRoot -Filter "*$ThreadId*.jsonl" -File -Recurse -ErrorAction Stop |
-                Where-Object { Test-CNBPathWithinRoot $_.FullName $sessionsRoot } |
-                Sort-Object LastWriteTimeUtc -Descending |
-                Select-Object -First 1
-            if ($null -ne $match)
-            {
-                return [pscustomobject]@{ Reason = "session-transcript"; TranscriptPath = $match.FullName }
-            }
-        }
-        catch {}
-    }
     return $null
 }
 
@@ -176,6 +160,22 @@ function Resolve-CNBNativeCommand
         return $command
     }
     catch { return @() }
+}
+
+function Test-CNBChainedNotify
+{
+    param([string]$ConfigPath)
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { return $false }
+    try { $text = [IO.File]::ReadAllText($ConfigPath) }
+    catch { return $false }
+    $firstTable = [regex]::Match($text, '(?m)^[ \t]*\[')
+    $prefix = if ($firstTable.Success) { $text.Substring(0, $firstTable.Index) } else { $text }
+    $line = [regex]::Match($prefix, '(?m)^[ \t]*notify[ \t]*=[^\r\n]*')
+    if (-not $line.Success) { return $false }
+    $value = $line.Value
+    return $value.IndexOf("--previous-notify", [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+        $value.IndexOf("codex-computer-use.exe", [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+        $value.IndexOf("Invoke-CodexNotifyBridge.ps1", [StringComparison]::OrdinalIgnoreCase) -ge 0
 }
 
 function Start-CNBProcess
@@ -256,25 +256,71 @@ function Invoke-CodexNotifyBridge
         Write-CNBLog $LocalAppDataPath "Codex notify bridge skipped: unsupported event"
         return [pscustomobject]@{ Skipped = $true; Reason = "unsupported-event" }
     }
-    $threadId = [string](Get-CNBProperty $notification "thread-id")
     $codexHome = Join-Path $UserProfilePath ".codex"
-    $evidence = Find-CNBSessionEvidence -CodexHome $codexHome -ThreadId $threadId
-    if ($null -eq $evidence)
-    {
-        Write-CNBLog $LocalAppDataPath "Codex notify bridge skipped: unpersisted session"
-        return [pscustomobject]@{ Skipped = $true; Reason = "unpersisted-codex-session" }
-    }
-    $larkPayload = ConvertTo-CNBLarkPayload $notification $evidence
-    $larkPayloadJson = $larkPayload | ConvertTo-Json -Compress -Depth 20
     $nativeCommand = @(Resolve-CNBNativeCommand $LocalAppDataPath)
+    $chained = Test-CNBChainedNotify (Join-Path $UserProfilePath ".codex\config.toml")
     $notifyScript = Join-Path $UserProfilePath ".agents\hooks\lark-notify.ps1"
     $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
     $larkArguments = @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $notifyScript, "-Source", "codex")
+    $nativeState = if ($chained) { "ChainedSkipped" } elseif ($nativeCommand.Count -ge 2) { "Planned" } else { "Unavailable" }
+    $threadId = [string](Get-CNBProperty $notification "thread-id")
+    $evidence = Find-CNBSessionEvidence -CodexHome $codexHome -ThreadId $threadId
+    if ($null -eq $evidence)
+    {
+        if ($DryRun)
+        {
+            return [pscustomobject][ordered]@{
+                Skipped = $true
+                Reason = "non-top-level-codex-session"
+                Chained = $chained
+                Native = $nativeState
+                Lark = "Skipped"
+                NativeCommand = $nativeCommand
+            }
+        }
+        $nativeHandle = $null
+        try
+        {
+            if ($nativeCommand.Count -ge 2 -and -not $chained)
+            {
+                $nativeHandle = Start-CNBProcess -FilePath $nativeCommand[0] -Arguments (@($nativeCommand[1..($nativeCommand.Count - 1)]) + $PayloadJson) -StandardInput ""
+            }
+            $nativeResult = if ($chained) {
+                [pscustomobject]@{ State = "ChainedSkipped"; Detail = "" }
+            } elseif ($null -eq $nativeHandle) {
+                [pscustomobject]@{ State = "Unavailable"; Detail = "" }
+            } else {
+                Complete-CNBProcess $nativeHandle 10
+            }
+            Write-CNBLog $LocalAppDataPath "Codex notify bridge skipped Lark: reason=non-top-level-codex-session native=$($nativeResult.State) chained=$chained"
+            return [pscustomobject]@{
+                Skipped = $true
+                Reason = "non-top-level-codex-session"
+                Native = $nativeResult.State
+                Lark = "Skipped"
+            }
+        }
+        catch
+        {
+            Write-CNBLog $LocalAppDataPath "Codex notify bridge native branch failed for non-top-level session: $($_.Exception.Message)"
+            return [pscustomobject]@{
+                Skipped = $true
+                Reason = "non-top-level-codex-session"
+                Native = "Failed"
+                Lark = "Skipped"
+            }
+        }
+    }
+    $larkPayload = ConvertTo-CNBLarkPayload $notification $evidence
+    $larkPayloadJson = $larkPayload | ConvertTo-Json -Compress -Depth 20
     if ($DryRun)
     {
         return [pscustomobject][ordered]@{
             Skipped = $false
             Evidence = $evidence.Reason
+            Chained = $chained
+            Native = $nativeState
+            Lark = "Planned"
             LarkPayload = $larkPayload
             NativeCommand = $nativeCommand
             LarkCommand = @($powershell) + $larkArguments
@@ -284,7 +330,10 @@ function Invoke-CodexNotifyBridge
     $larkHandle = $null
     try
     {
-        if ($nativeCommand.Count -ge 2)
+        # In chained mode Codex already ran the native turn-ended hook and then
+        # invoked this bridge through --previous-notify; running it again would
+        # duplicate the native notification.
+        if ($nativeCommand.Count -ge 2 -and -not $chained)
         {
             $nativeHandle = Start-CNBProcess -FilePath $nativeCommand[0] -Arguments (@($nativeCommand[1..($nativeCommand.Count - 1)]) + $PayloadJson) -StandardInput ""
         }
@@ -292,9 +341,15 @@ function Invoke-CodexNotifyBridge
         {
             $larkHandle = Start-CNBProcess -FilePath $powershell -Arguments $larkArguments -StandardInput $larkPayloadJson
         }
-        $nativeResult = if ($null -eq $nativeHandle) { [pscustomobject]@{ State = "Unavailable"; Detail = "" } } else { Complete-CNBProcess $nativeHandle 10 }
+        $nativeResult = if ($chained) {
+            [pscustomobject]@{ State = "ChainedSkipped"; Detail = "" }
+        } elseif ($null -eq $nativeHandle) {
+            [pscustomobject]@{ State = "Unavailable"; Detail = "" }
+        } else {
+            Complete-CNBProcess $nativeHandle 10
+        }
         $larkResult = if ($null -eq $larkHandle) { [pscustomobject]@{ State = "Unavailable"; Detail = "" } } else { Complete-CNBProcess $larkHandle 30 }
-        Write-CNBLog $LocalAppDataPath "Codex notify bridge complete: native=$($nativeResult.State) lark=$($larkResult.State) evidence=$($evidence.Reason)"
+        Write-CNBLog $LocalAppDataPath "Codex notify bridge complete: native=$($nativeResult.State) lark=$($larkResult.State) evidence=$($evidence.Reason) chained=$chained"
         return [pscustomobject]@{ Skipped = $false; Native = $nativeResult.State; Lark = $larkResult.State }
     }
     catch

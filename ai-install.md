@@ -19,6 +19,7 @@ macOS/Linux: ~/.agents
 |---|---|---|---|---|
 | `skills/*/SKILL.md` | 需要链接到 `~/.claude/skills` | 原生读取 `~/.agents/skills` | 原生读取 `~/.agents/skills` | 原生读取 `~/.agents/skills` |
 | 共享指令/规则 | `CLAUDE.md`、`.claude/rules` | `~/.codex/AGENTS.md` | `~/.config/opencode/AGENTS.md` 或 `instructions` | `$DSH_HOME/AGENTS.md` |
+| Chrome DevTools MCP | 支持，共用固定版本依赖 | 支持，共用固定版本依赖 | 当前未接入 | 当前未接入 |
 | `hooks/lark-notify.ps1` | 支持 | 支持 | 当前未接入 | 当前未接入 |
 | `lark-claude` 远程网关 | 可作为执行器 | 可作为执行器 | 当前不支持 | 当前不支持 |
 
@@ -67,6 +68,25 @@ Windows 推荐顺序：
 
 Junction 不需要管理员权限，但只能用于目录。本文的 Skill 接入脚本默认使用 Junction。
 
+### 2.3 Chrome DevTools MCP（Claude/Codex 可选）
+
+仓库使用以下目录保存 Claude Code 和 Codex 共用的依赖锁文件：
+
+```text
+~/.agents/tools/chrome-devtools-mcp
+```
+
+`node_modules/` 不进入 Git。需要浏览器 MCP 时，在新电脑恢复依赖：
+
+```powershell
+$ToolRoot = Join-Path $env:USERPROFILE ".agents\tools\chrome-devtools-mcp"
+npm ci --prefix $ToolRoot
+```
+
+随后分别合并 Claude Code 用户级 MCP 配置和 `~/.codex/config.toml`。当前方案使用本地固定版本脚本和 `--autoConnect`，不依赖运行时执行 `npx ...@latest`。
+
+若要附着日常 Chrome，浏览器版本需为 144 或更高，并由用户在 `chrome://inspect/#remote-debugging` 中手动允许远程调试。完整命令、配置片段、安全边界、验收和排障见 [Chrome DevTools MCP 部署说明](tools/chrome-devtools-mcp/README.md)。
+
 ## 3. Clone 或更新 `.agents`
 
 ### 3.1 首次 Clone
@@ -109,7 +129,7 @@ Get-ChildItem (Join-Path $AgentsRoot "skills") -Directory
 Get-ChildItem $AgentsRoot -Force
 ```
 
-应至少看到 `skills` 和本文件 `ai-install.md`。`hooks`、`lark-claude` 是否存在取决于仓库包含的能力。
+应至少看到 `skills` 和本文件 `ai-install.md`。`hooks`、`claude-projects/lark` 是否存在取决于仓库包含的能力。
 
 ## 4. 接入 Claude Code
 
@@ -504,7 +524,7 @@ finally
 网关目录：
 
 ```text
-~/.agents/lark-claude
+~/.agents/claude-projects/lark
 ```
 
 它支持飞书自然语言控制 Claude/Codex 独立 Session，不支持 OpenCode 或 DeepSeek Harness。
@@ -517,15 +537,15 @@ finally
 
 目标电脑必须重新完成以下配置：
 
-1. `lark-claude/config/gateway.json` 中的用户 `open_id`、模型和四个可执行文件绝对路径。
-2. `lark-claude/config/projects.json` 中的项目绝对路径和别名。
+1. `claude-projects/lark/config/gateway.json` 中的用户 `open_id`、模型和四个可执行文件绝对路径。
+2. `claude-projects/lark/config/projects.json` 中的项目绝对路径和别名。
 3. lark-cli Bot 配置。
 4. Claude/Codex 登录或模型代理。
 
 验证并安装：
 
 ```powershell
-Set-Location "$env:USERPROFILE\.agents\lark-claude"
+Set-Location "$env:USERPROFILE\.agents\claude-projects\lark"
 npm test
 ./scripts/install-task.ps1
 npm run status
@@ -541,9 +561,10 @@ npm run status
 | 4 | `codex debug prompt-input` | 出现 Skill 路径与自包含指令正文 |
 | 5 | OpenCode `/skills` | 列出用户级 Skill |
 | 6 | DSH 列出 Skill | 列出用户级 Skill |
-| 7 | Hook `-DryRun` | 结束事件有消息，Codex PermissionRequest 返回 `{}` |
-| 8 | `npm test` | 飞书网关测试全部通过 |
-| 9 | `npm run status` | `listenerReady: true`、事件消费者为 1 |
+| 7 | Chrome DevTools MCP | Claude 显示 `Connected`；Codex 显示 `enabled`；`autoConnect` 能列出现有 Chrome 标签页 |
+| 8 | Hook `-DryRun` | 结束事件有消息，Codex PermissionRequest 返回 `{}` |
+| 9 | `npm test` | 飞书网关测试全部通过 |
+| 10 | `npm run status` | `listenerReady: true`、事件消费者为 1 |
 
 ## 11. 更新与回滚
 
@@ -558,7 +579,7 @@ git -C $AgentsRoot pull --ff-only
 
 1. 重新运行 Claude Skill Junction 脚本，以接入新增顶层 Skill。
 2. 新建执行器会话，避免旧会话缓存。
-3. 若 `hooks` 或 `lark-claude` 有变化，重新执行对应验收。
+3. 若 `hooks` 或 `claude-projects/lark` 有变化，重新执行对应验收。
 
 ### 回滚
 
@@ -592,7 +613,7 @@ Codex 原生扫描 Skill，但用户规则必须进入 `~/.codex/AGENTS.md`。`@
 ## 13. 安全边界
 
 - 禁止提交 Claude/Codex/lark-cli 的 Token、App Secret、Cookie、认证缓存和 `.env`。
-- 禁止提交 `lark-claude/data`、`run`、`logs` 等运行时数据。
+- 禁止提交 `claude-projects/lark/data`、`run`、`logs` 等运行时数据。
 - 不要让 Git clone 或部署脚本覆盖非空的 `~/.claude`、`~/.codex`、OpenCode 或 DSH 配置目录。
 - Hook 命令必须使用目标电脑的真实绝对路径。
 - `.agents` 中的脚本和 Skill 具有本机执行能力；部署前应审查仓库来源和提交记录。

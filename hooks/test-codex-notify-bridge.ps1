@@ -88,8 +88,39 @@ exit 0
 
     $missingPayload = $payload | ConvertFrom-Json
     $missingPayload.'thread-id' = "missing-thread"
+    $missingTranscriptRoot = Join-Path $codexHome "sessions\2026\10\24"
+    [IO.Directory]::CreateDirectory($missingTranscriptRoot) | Out-Null
+    '{"type":"session_meta","payload":{"source":{"subagent":{"thread_spawn":{}}}}}' |
+        Set-Content -LiteralPath (Join-Path $missingTranscriptRoot "rollout-missing-thread.jsonl") -Encoding UTF8
     $missing = Invoke-CodexNotifyBridge -PayloadJson ($missingPayload | ConvertTo-Json -Compress) -UserProfilePath $profile -LocalAppDataPath $local -DryRun
-    Assert-Equals $missing.Reason "unpersisted-codex-session" "unpersisted event skipped"
+    Assert-Equals $missing.Reason "non-top-level-codex-session" "transcript-only event skipped"
+    Assert-Equals $missing.Native "Planned" "direct native preserved for transcript-only event"
+    Assert-Equals $missing.Lark "Skipped" "transcript-only event does not reach lark"
+
+    $missingLive = Invoke-CodexNotifyBridge -PayloadJson ($missingPayload | ConvertTo-Json -Compress) -UserProfilePath $profile -LocalAppDataPath $local
+    Assert-Equals $missingLive.Native "Failed" "direct native runs for transcript-only event"
+    Assert-Equals $missingLive.Lark "Skipped" "transcript-only live event does not reach lark"
+
+    $emptyThreadPayload = $payload | ConvertFrom-Json
+    $emptyThreadPayload.'thread-id' = ""
+    $emptyThread = Invoke-CodexNotifyBridge -PayloadJson ($emptyThreadPayload | ConvertTo-Json -Compress) -UserProfilePath $profile -LocalAppDataPath $local -DryRun
+    Assert-Equals $emptyThread.Reason "non-top-level-codex-session" "empty thread skipped for lark"
+    Assert-Equals $emptyThread.Native "Planned" "direct native preserved for empty thread"
+
+    $bridgePath = Join-Path $profile ".agents\hooks\Invoke-CodexNotifyBridge.ps1"
+    $previousNotify = @("powershell.exe", "-File", $bridgePath) | ConvertTo-Json -Compress
+    $chainedLine = "notify = ['$nativePath', ""turn-ended"", ""--previous-notify"", '$previousNotify']"
+    Set-Content -LiteralPath (Join-Path $codexHome "config.toml") -Value $chainedLine -Encoding UTF8 -NoNewline
+    $chainedDry = Invoke-CodexNotifyBridge -PayloadJson $payload -UserProfilePath $profile -LocalAppDataPath $local -DryRun
+    Assert-True $chainedDry.Chained "chained Codex notify detected"
+    $chainedLive = Invoke-CodexNotifyBridge -PayloadJson $payload -UserProfilePath $profile -LocalAppDataPath $local
+    Assert-Equals $chainedLive.Native "ChainedSkipped" "native notify skipped when chained"
+    Assert-Equals $chainedLive.Lark "Completed" "lark branch completes when chained"
+
+    $chainedMissing = Invoke-CodexNotifyBridge -PayloadJson ($missingPayload | ConvertTo-Json -Compress) -UserProfilePath $profile -LocalAppDataPath $local -DryRun
+    Assert-Equals $chainedMissing.Reason "non-top-level-codex-session" "chained transcript-only event skipped"
+    Assert-Equals $chainedMissing.Native "ChainedSkipped" "chained native is not repeated for transcript-only event"
+    Assert-Equals $chainedMissing.Lark "Skipped" "chained transcript-only event does not reach lark"
 
     $powershell = (Get-Command powershell.exe -ErrorAction Stop).Source
     $blocked = Start-CNBProcess -FilePath $powershell -Arguments @("-NoProfile", "-Command", "Start-Sleep -Seconds 10") -StandardInput ""

@@ -7,7 +7,7 @@
 网关目录：
 
 ```text
-C:\Users\<UserName>\.agents\lark-claude
+C:\Users\<UserName>\.agents\claude-projects\lark
 ```
 
 工作流程：
@@ -79,7 +79,7 @@ C:\Users\<UserName>\.agents\lark-claude
 ### 3.1 查看状态
 
 ```powershell
-Set-Location "$env:USERPROFILE\.agents\lark-claude"
+Set-Location "$env:USERPROFILE\.agents\claude-projects\lark"
 npm run status
 Get-ScheduledTask -TaskName "LarkClaudeGateway"
 ```
@@ -94,7 +94,7 @@ Get-ScheduledTask -TaskName "LarkClaudeGateway"
 ### 3.2 手工启动与停止
 
 ```powershell
-Set-Location "$env:USERPROFILE\.agents\lark-claude"
+Set-Location "$env:USERPROFILE\.agents\claude-projects\lark"
 ./scripts/start.ps1
 ./scripts/stop.ps1
 ```
@@ -110,7 +110,7 @@ Start-ScheduledTask -TaskName "LarkClaudeGateway"
 重新注册计划任务：
 
 ```powershell
-Set-Location "$env:USERPROFILE\.agents\lark-claude"
+Set-Location "$env:USERPROFILE\.agents\claude-projects\lark"
 ./scripts/install-task.ps1
 ```
 
@@ -131,7 +131,7 @@ Session 数据：<网关目录>\data\gateway.sqlite
 
 ```powershell
 Stop-ScheduledTask -TaskName "LarkClaudeGateway"
-Set-Location "$env:USERPROFILE\.agents\lark-claude"
+Set-Location "$env:USERPROFILE\.agents\claude-projects\lark"
 ./scripts/stop.ps1
 ```
 
@@ -187,8 +187,8 @@ Set-Location "$env:USERPROFILE\.agents\lark-claude"
 ### 5.1 源电脑：停止并导出
 
 ```powershell
-$SourceGateway = Join-Path $env:USERPROFILE ".agents\lark-claude"
-$TransferGateway = "D:\Transfer\lark-claude"
+$SourceGateway = Join-Path $env:USERPROFILE ".agents\claude-projects\lark"
+$TransferGateway = "D:\Transfer\lark"
 
 Stop-ScheduledTask -TaskName "LarkClaudeGateway" -ErrorAction SilentlyContinue
 & (Join-Path $SourceGateway "scripts\stop.ps1")
@@ -271,10 +271,10 @@ stderr 出现以下标记表示监听建立成功：
 
 ```powershell
 $TargetAgents = Join-Path $env:USERPROFILE ".agents"
-$TargetGateway = Join-Path $TargetAgents "lark-claude"
+$TargetGateway = Join-Path $TargetAgents "claude-projects\lark"
 
 New-Item -ItemType Directory -Path $TargetGateway -Force | Out-Null
-robocopy "D:\Transfer\lark-claude" $TargetGateway /E
+robocopy "D:\Transfer\lark" $TargetGateway /E
 ```
 
 不要使用会删除目标文件的 `/MIR`，除非已经人工确认目标目录中没有需要保留的内容。
@@ -284,8 +284,8 @@ robocopy "D:\Transfer\lark-claude" $TargetGateway /E
 编辑：
 
 ```text
-<目标用户目录>\.agents\lark-claude\config\gateway.json
-<目标用户目录>\.agents\lark-claude\config\projects.json
+<目标用户目录>\.agents\claude-projects\lark\config\gateway.json
+<目标用户目录>\.agents\claude-projects\lark\config\projects.json
 ```
 
 必须更新：
@@ -331,7 +331,7 @@ C:\Users\<UserName>\.agents\hooks\lark-notify.ps1
 ### 5.7 测试并安装计划任务
 
 ```powershell
-Set-Location "$env:USERPROFILE\.agents\lark-claude"
+Set-Location "$env:USERPROFILE\.agents\claude-projects\lark"
 npm test
 ./scripts/install-task.ps1
 ```
@@ -343,7 +343,7 @@ npm test
 ### 6.1 本地验收
 
 ```powershell
-Set-Location "$env:USERPROFILE\.agents\lark-claude"
+Set-Location "$env:USERPROFILE\.agents\claude-projects\lark"
 npm test
 npm run status
 lark-cli event status --json
@@ -377,7 +377,7 @@ lark-cli event status --json
 
 ```powershell
 Get-ScheduledTask -TaskName "LarkClaudeGateway"
-Set-Location "$env:USERPROFILE\.agents\lark-claude"
+Set-Location "$env:USERPROFILE\.agents\claude-projects\lark"
 npm run status
 lark-cli event status --json
 ```
@@ -405,7 +405,7 @@ lark-cli event status --json
 重新执行：
 
 ```powershell
-Set-Location "$env:USERPROFILE\.agents\lark-claude"
+Set-Location "$env:USERPROFILE\.agents\claude-projects\lark"
 ./scripts/install-task.ps1
 ```
 
