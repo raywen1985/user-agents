@@ -1,5 +1,13 @@
 const definitions = Object.freeze([
   Object.freeze({
+    name: "off_work",
+    description: "SessionMgr 下班：独立文字命令‘下班’关闭已识别 Agent 客户端；‘下班检查’只读预览",
+  }),
+  Object.freeze({
+    name: "list_agent_sessions",
+    description: "逐条列出本机全部项目的 Claude Code 或 Codex 历史会话，自动分批返回完整列表",
+  }),
+  Object.freeze({
     name: "list_active_agent_sessions",
     description: "查询当前 PC 上正在工作的 Codex、Claude Code 和网关 Session",
   }),

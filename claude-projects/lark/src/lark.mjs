@@ -22,6 +22,20 @@ export function classifyInboundMessage(messageType, content) {
   return POST_RESOURCE_PATTERN.test(String(content || "")) ? "post_resource" : "text";
 }
 
+export function canAcceptUserMessage(message, allowedOpenIds) {
+  return message.chat_type === "p2p" && message.sender_type === "user"
+    && allowedOpenIds.includes(message.sender_id) && Boolean(message.message_id)
+    && (classifyInboundMessage(message.message_type, message.content) === "unsupported" || Boolean(message.content));
+}
+
+export function inboundUnavailableText(message, voiceEnabled) {
+  const kind = classifyInboundMessage(message.message_type, message.content);
+  if (kind === "unsupported") return "当前远程控制仅支持纯文本和语音，暂不支持直接发送图片、文件或视频。请改发文字说明。";
+  if (kind === "post_resource") return "此条富文本消息包含图片或附件，无法作为远程指令处理；请改发纯文本消息。";
+  if (kind === "audio" && !voiceEnabled) return "当前网关未启用语音消息，请改发文字。";
+  return null;
+}
+
 export function normalizeLarkEvent(value) {
   if (!value || typeof value !== "object") return null;
   return {

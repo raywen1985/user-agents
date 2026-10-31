@@ -610,6 +610,24 @@ Codex 原生扫描 Skill，但用户规则必须进入 `~/.codex/AGENTS.md`。`@
 
 不建议。执行器配置通常同时包含机器路径、登录状态、插件配置和凭据。仓库只保存可共享模板；目标电脑按本文合并配置并重新认证。
 
+### 持续收集与跨 PC 安装设置
+
+`config-sync` 可从当前 Claude / Codex 配置收集白名单设置，并在其他 Windows PC 合并安装。认证、本机权限历史与运行时路径留在本机；源文件通过占位符表达用户目录、仓库目录和临时目录。
+
+```powershell
+npm ci --ignore-scripts --prefix ./config-sync/tools
+./config-sync/Sync-AgentConfig.ps1 collect -WhatIf
+./config-sync/Sync-AgentConfig.ps1 collect
+
+# 目标 PC 先完成所选功能的安装和认证，再预览合并：
+./config-sync/Sync-AgentConfig.ps1 install -WhatIf
+./config-sync/Sync-AgentConfig.ps1 install
+```
+
+本机设置保持 Git 忽略。只提交 `config-sync/policy.json`、工具源码和 `config-sync/sources/`，不复制 `local/config-sync/` 中的基线与备份。同步器或策略更新后需审查差异并显式重建基线。可选登录监视器需单独启用。
+
+字段范围、依赖预检、冲突解决、恢复和监视器启停见 [配置同步说明](config-sync/README.md)。
+
 ## 13. 安全边界
 
 - 禁止提交 Claude/Codex/lark-cli 的 Token、App Secret、Cookie、认证缓存和 `.env`。

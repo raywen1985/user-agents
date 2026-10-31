@@ -53,6 +53,13 @@ test("standard session commands are split deterministically before the router", 
   });
 }));
 
+test("reported Claude list request bypasses the router and does not return project overview", () => withStore(async (store) => {
+  const subject = coordinator(store);
+  const result = await subject.coordinate(message("列出所有claudecode会话"));
+  assert.equal(subject.calls, 0);
+  assert.deepEqual(result, { type: "internal_skill", skillName: "list_agent_sessions", overviewExecutor: "claude" });
+}));
+
 test("exact typed SVN restore command carries a task-scoped approval profile", () => withStore(async (store) => {
   const subject = coordinator(store);
   const resolved = await subject.coordinate(message("codex TTTT 还原svn所有修改", { message_type: "text" }));

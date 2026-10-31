@@ -1,0 +1,69 @@
+disable_response_storage = true
+model = "gpt-6-astra"
+model_provider = "custom"
+model_reasoning_effort = "xhigh"
+notify = [ "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "${AGENTS_ROOT}/hooks/Invoke-CodexNotifyBridge.ps1" ]
+
+[desktop]
+conversationDetailMode = "STEPS_COMMANDS"
+followUpQueueMode = "steer"
+show-context-window-usage = true
+toys-confetti-enabled = false
+
+[features]
+chronicle = false
+memories = false
+rmcp_client = true
+
+[mcp_servers]
+[mcp_servers.chrome-devtools]
+args = [ "${AGENTS_ROOT}/tools/chrome-devtools-mcp/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js", "--autoConnect", "--no-usage-statistics" ]
+command = "node"
+
+[memories]
+generate_memories = false
+use_memories = false
+
+[model_providers]
+[model_providers.custom]
+base_url = "http://127.0.0.1:15721/v1"
+name = "custom"
+requires_openai_auth = true
+wire_api = "responses"
+
+[plugins]
+[plugins."browser@openai-bundled"]
+enabled = true
+
+[plugins."codex-app-tools@openai-bundled"]
+enabled = true
+
+[plugins."computer-use@openai-bundled"]
+enabled = true
+
+[plugins."documents@openai-primary-runtime"]
+enabled = true
+
+[plugins."pdf@openai-primary-runtime"]
+enabled = true
+
+[plugins."presentations@openai-primary-runtime"]
+enabled = true
+
+[plugins."spreadsheets@openai-primary-runtime"]
+enabled = true
+
+[plugins."template-creator@openai-primary-runtime"]
+enabled = true
+
+[plugins."unified-computer-use@openai-bundled"]
+enabled = true
+
+[plugins."visualize@openai-bundled"]
+enabled = true
+
+[tui]
+status_line = [ "model-with-reasoning", "context-remaining", "current-dir" ]
+
+[windows]
+sandbox = "elevated"

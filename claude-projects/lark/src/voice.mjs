@@ -9,9 +9,10 @@ const MAX_TRANSCRIPT_LENGTH = 4000;
 const FILE_KEY_PATTERN = /^file_[A-Za-z0-9._-]{1,512}$/;
 const AUDIO_ELEMENT_PATTERN = /^<audio\b[^>]*\bkey="([^"]+)"[^>]*\bduration="([^"]+)"/i;
 
-function voiceError(code, message = code) {
+function voiceError(code, message = code, upstreamCode = null) {
   const error = new Error(message);
   error.code = code;
+  error.upstreamCode = upstreamCode;
   return error;
 }
 
@@ -96,7 +97,10 @@ function payloadOf(result) {
 }
 
 function isScopeError(payload) {
-  return payload?.error?.code === 99991672 || payload?.error?.subtype === "app_scope_not_applied";
+  const error = payload?.error || payload;
+  return [99991672, 99991679].includes(Number(error?.code))
+    || ["app_scope_not_applied", "missing_scope"].includes(error?.subtype)
+    || error?.missing_scopes?.includes("speech_to_text:speech");
 }
 
 function isRetryableRateLimit(payload) {
@@ -106,9 +110,13 @@ function isRetryableRateLimit(payload) {
 }
 
 function assertSuccess(result, code, payload) {
-  if (payload?.ok === false) {
+  if (payload?.ok === false || payload?.code != null && Number(payload.code) !== 0) {
+    const upstreamCode = Number(payload.error?.code ?? payload.code) || null;
     if (isScopeError(payload)) throw voiceError("VOICE_SCOPE_MISSING", "speech_to_text:speech is not granted");
-    if (isRetryableRateLimit(payload)) throw voiceError("VOICE_RATE_LIMITED", "Speech recognition rate limited");
+    if (/free.*not support|not support.*free|免费版|套餐.*不支持|subscription.*required/i.test(payload.error?.message || payload.msg || '')) {
+      throw voiceError("VOICE_SERVICE_UNAVAILABLE", "Speech recognition service unavailable for this tenant", upstreamCode);
+    }
+    if (isRetryableRateLimit(payload)) throw voiceError("VOICE_RATE_LIMITED", "Speech recognition rate limited", upstreamCode);
     throw voiceError(code, payload.error?.message || "lark-cli returned an error");
   }
   if (result.code !== 0) throw voiceError(code, `lark-cli exited with ${result.code}`);
@@ -165,6 +173,8 @@ export class VoiceTranscriber {
     downloadArgs = defaultDownloadArgs,
     transcodeArgs = defaultTranscodeArgs,
     recognizeArgs = defaultRecognizeArgs,
+    checkScope = null,
+    onRecognition = () => {},
   } = {}) {
     if (typeof executable !== "string" || !executable) throw new Error("Voice transcriber requires a lark-cli executable");
     this.executable = executable;
@@ -180,19 +190,25 @@ export class VoiceTranscriber {
     this.downloadArgs = downloadArgs;
     this.transcodeArgs = transcodeArgs;
     this.recognizeArgs = recognizeArgs;
+    this.checkScope = checkScope;
+    this.onRecognition = onRecognition;
   }
 
-  async recognize(bodyPath) {
+  async recognize(bodyPath, cwd) {
     for (let attempt = 0; ; attempt += 1) {
       const result = await this.run(this.executable, this.recognizeArgs({ bodyPath }), {
         env: loadChildEnvironment(),
+        cwd,
         timeoutMs: this.timeoutMs,
         maxOutputBytes: 1024 * 1024,
       });
       try {
         assertSuccess(result, "VOICE_RECOGNITION_FAILED", payloadOf(result));
-        return recognitionText(result.stdout);
+        const text = recognitionText(result.stdout);
+        this.onRecognition('ok');
+        return text;
       } catch (error) {
+        this.onRecognition(error.code, error.upstreamCode);
         const delayMs = this.recognitionRetryDelaysMs[attempt];
         if (error.code !== "VOICE_RATE_LIMITED" || delayMs === undefined) throw error;
         await this.sleep(delayMs);
@@ -204,13 +220,18 @@ export class VoiceTranscriber {
     if (durationMs > this.maxDurationMs) {
       throw voiceError("VOICE_TOO_LONG", "Voice message exceeds the duration limit");
     }
+    if ((await this.checkScope?.())?.permission === 'missing') {
+      this.onRecognition('VOICE_SCOPE_MISSING');
+      throw voiceError('VOICE_SCOPE_MISSING');
+    }
     const directory = fs.mkdtempSync(path.join(this.tempRoot, "lark-claude-voice-"));
     const downloadPath = path.join(directory, "audio.opus");
     const pcmPath = path.join(directory, "audio.pcm");
     const bodyPath = path.join(directory, "request.json");
     try {
-      const download = await this.run(this.executable, this.downloadArgs({ messageId, fileKey, outputPath: downloadPath }), {
+      const download = await this.run(this.executable, this.downloadArgs({ messageId, fileKey, outputPath: path.basename(downloadPath) }), {
         env: loadChildEnvironment(),
+        cwd: directory,
         timeoutMs: this.timeoutMs,
       });
       assertSuccess(download, "VOICE_DOWNLOAD_FAILED", payloadOf(download));
@@ -227,7 +248,7 @@ export class VoiceTranscriber {
         speech: { speech: fs.readFileSync(pcmPath).toString("base64") },
         config: { file_id: requestFileId(messageId), format: "pcm", engine_type: this.engineType },
       }));
-      const text = await this.recognize(bodyPath);
+      const text = await this.recognize(path.basename(bodyPath), directory);
       if (!text) throw voiceError("VOICE_EMPTY", "Speech recognition returned no text");
       return text.slice(0, MAX_TRANSCRIPT_LENGTH);
     } finally {
@@ -247,7 +268,9 @@ export function voiceFailureText(error) {
     case "VOICE_SCOPE_MISSING":
       return "语音识别权限未开通，请在飞书开发者后台申请 speech_to_text:speech 后重试。";
     case "VOICE_RATE_LIMITED":
-      return "飞书语音识别服务当前限流，请稍后重试或改用文字。";
+      return "飞书语音识别接口返回限流，已短暂重试。若持续发生，请核查租户套餐与服务配额（免费版不支持此接口）；当前可改用文字。";
+    case "VOICE_SERVICE_UNAVAILABLE":
+      return "当前租户套餐或服务状态不支持飞书语音识别，请检查语音服务开通状态；当前可改用文字。";
     case "VOICE_TRANSCODE_FAILED":
       return "语音转码失败，请稍后重试或改用文字。";
     default:

@@ -361,7 +361,8 @@ elseif ($mode -eq "stderr_definitive_then_success" -and $count -eq 1)
 }
 else
 {
-    Write-Output '{"ok":true,"data":{"message_id":"om_test"}}'
+    $keyIndex = [Array]::IndexOf($RemainingArguments, '--idempotency-key')
+    @{ ok = $true; data = @{ message_id = ('om_' + $RemainingArguments[$keyIndex + 1]); chat_id = 'oc_test' } } | ConvertTo-Json -Compress
     $global:LASTEXITCODE = 0
 }
 exit $global:LASTEXITCODE
@@ -428,7 +429,7 @@ exit $global:LASTEXITCODE
     $claudePayload = @{
         hook_event_name = "Stop"
         prompt_id = "prompt-shared"
-        session_id = "claude-session"
+        session_id = "22222222-2222-4222-8222-222222222222"
         session_name = "Card work"
         transcript_path = ([Uri]$claudeTranscript).AbsoluteUri
         cwd = "D:\WA\unity_asset"
@@ -629,6 +630,15 @@ exit $global:LASTEXITCODE
     Assert-Equals (Get-ArgumentValue $calls[0].Arguments "--format") "json" "typed JSON output requested"
     $sentCard = (Get-ArgumentValue $calls[0].Arguments "--content") | ConvertFrom-Json
     Assert-Equals $sentCard.schema "2.0" "sent Card 2.0 JSON"
+    $bindingDirectory = Join-Path $testUserProfile '.agents\claude-projects\lark\data\notification-bindings'
+    $claudeBindingPath = Join-Path $bindingDirectory ("om_{0}.json" -f $claude.CardIdempotencyKey)
+    $claudeBinding = Get-Content -Raw -LiteralPath $claudeBindingPath | ConvertFrom-Json
+    Assert-Equals $claudeBinding.nativeId $claudePayload.session_id "card binds exact native session"
+    Assert-Equals $claudeBinding.executor 'claude' "card binds executor"
+    Assert-Equals $claudeBinding.recipientOpenId 'ou_test' "card binds recipient"
+    Assert-Equals $claudeBinding.chatId 'oc_test' "card binds chat"
+    Assert-NotContains (Get-Content -Raw -LiteralPath $claudeBindingPath) 'secret-value' "binding excludes notification text"
+    Assert-Equals (@(Get-ChildItem -LiteralPath $bindingDirectory -Filter '*.tmp')).Count 0 "binding publish is atomic"
 
     Reset-FakeCalls
     foreach ($name in @("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"))
@@ -686,11 +696,16 @@ exit $global:LASTEXITCODE
     Assert-Equals (Get-ArgumentValue $calls[0].Arguments "--msg-type") "interactive" "first call is card"
     Assert-True ($calls[1].Arguments -contains "--text") "second call is text"
     Assert-NotEquals (Get-ArgumentValue $calls[0].Arguments "--idempotency-key") (Get-ArgumentValue $calls[1].Arguments "--idempotency-key") "send-path keys differ"
+    $fallbackBinding = Get-Content -Raw -LiteralPath (Join-Path $bindingDirectory ("om_{0}.json" -f $codex.FallbackIdempotencyKey)) | ConvertFrom-Json
+    Assert-Equals $fallbackBinding.nativeId $sessionId "fallback binds exact native session"
+    Assert-Equals $fallbackBinding.executor 'codex' "fallback binds executor"
 
     Reset-FakeCalls
     $env:LARK_NOTIFY_FAKE_MODE = "ambiguous"
+    $bindingCount = @(Get-ChildItem -LiteralPath $bindingDirectory -Filter '*.json').Count
     Assert-Equals (Invoke-Notify -Source claude -Payload $claudePayload) "{}" "ambiguous failure hook output"
     Assert-Equals (@(Get-FakeCalls)).Count 1 "ambiguous failure has no fallback"
+    Assert-Equals (@(Get-ChildItem -LiteralPath $bindingDirectory -Filter '*.json')).Count $bindingCount "ambiguous send creates no binding"
 
     Reset-FakeCalls
     $env:LARK_NOTIFY_FAKE_MODE = "always_definitive"
@@ -709,6 +724,8 @@ exit $global:LASTEXITCODE
         $calls = @(Get-FakeCalls)
         Assert-Equals $calls.Count 1 "local card failure sends only fallback"
         Assert-True ($calls[0].Arguments -contains "--text") "local card failure uses text"
+        $localFallbackPath = Join-Path $bindingDirectory ("om_{0}.json" -f $claude.FallbackIdempotencyKey)
+        Assert-True (Test-Path -LiteralPath $localFallbackPath) "local card failure registers fallback"
     }
     finally
     {
@@ -716,6 +733,29 @@ exit $global:LASTEXITCODE
     }
 
     Assert-Contains (Get-NotifyLog) "Card send failed" "send failures logged"
+    $evidenceDirectory = Join-Path $testUserProfile '.claude/projects/reply-evidence'
+    $evidenceProject = Join-Path $testRoot 'reply-project'
+    New-Item -ItemType Directory -Path $evidenceDirectory, $evidenceProject -Force | Out-Null
+    $evidenceTranscript = Join-Path $evidenceDirectory ($claudePayload.session_id + '.jsonl')
+    [IO.File]::WriteAllText($evidenceTranscript, (@{ type = 'user'; sessionId = $claudePayload.session_id; cwd = $evidenceProject } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+    $evidencePayload = @{ session_id = $claudePayload.session_id; transcript_path = $evidenceTranscript; cwd = 'untrusted hint' }
+    $bindingConfig = @{ identity = 'bot'; recipientOpenId = 'ou_test' }
+    Save-NotificationBinding -Result @{ State = 'Sent'; MessageId = 'om_project_evidence'; ChatId = 'oc_test' } -Config $bindingConfig -Source claude -SessionId $claudePayload.session_id -Payload $evidencePayload
+    $evidenceBinding = Get-Content -Raw -LiteralPath (Join-Path $bindingDirectory 'om_project_evidence.json') | ConvertFrom-Json
+    Assert-Equals $evidenceBinding.version 2 'verified transcript upgrades notification binding'
+    Assert-Equals $evidenceBinding.projectPath (ConvertTo-NormalizedLocalPath $evidenceProject) 'project evidence comes from native envelope'
+    Assert-Equals $evidenceBinding.projectSourcePath (ConvertTo-NormalizedLocalPath $evidenceTranscript) 'binding retains source evidence'
+    foreach ($result in @(@{ State = 'Sent' }, @{ State = 'AmbiguousFailure'; MessageId = 'om_unconfirmed' }, @{ State = 'Sent'; MessageId = '../escape' }))
+    {
+        Save-NotificationBinding -Result $result -Config $bindingConfig -Source claude -SessionId $claudePayload.session_id
+    }
+    Assert-False (Test-Path -LiteralPath (Join-Path $bindingDirectory 'om_unconfirmed.json')) "unconfirmed identity is never registered"
+    $stableResult = @{ State = 'Sent'; MessageId = 'om_stable'; ChatId = 'oc_test' }
+    Save-NotificationBinding -Result $stableResult -Config $bindingConfig -Source claude -SessionId $claudePayload.session_id
+    Save-NotificationBinding -Result $stableResult -Config $bindingConfig -Source codex -SessionId $sessionId
+    $stable = Get-Content -Raw -LiteralPath (Join-Path $bindingDirectory 'om_stable.json') | ConvertFrom-Json
+    Assert-Equals $stable.nativeId $claudePayload.session_id "conflicting retries cannot rebind a sent notification"
+    Assert-Equals (@(Get-ChildItem -LiteralPath $bindingDirectory -Filter '*.tmp')).Count 0 "conflict cleans only temporary file"
     Write-Host "PASS: $assertionCount assertions"
 }
 finally

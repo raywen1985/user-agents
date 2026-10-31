@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "clients": ["claude", "codex"],
+  "claudeFields": ["autoUpdatesChannel", "includeCoAuthoredBy", "model", "theme", "permissions.defaultMode"],
+  "claudeEnv": ["ANTHROPIC_BASE_URL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME", "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME", "API_TIMEOUT_MS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CODE_SUBAGENT_MODEL"],
+  "codexFields": ["model", "model_reasoning_effort", "disable_response_storage", "desktop.followUpQueueMode", "desktop.conversationDetailMode", "desktop.toys-confetti-enabled", "desktop.show-context-window-usage", "features.rmcp_client", "features.memories", "features.chronicle", "memories.generate_memories", "memories.use_memories", "windows.sandbox", "tui.status_line"],
+  "providers": ["custom"],
+  "mcpServers": ["chrome-devtools"],
+  "plugins": ["documents@openai-primary-runtime", "pdf@openai-primary-runtime", "spreadsheets@openai-primary-runtime", "presentations@openai-primary-runtime", "template-creator@openai-primary-runtime", "browser@openai-bundled", "unified-computer-use@openai-bundled", "computer-use@openai-bundled", "visualize@openai-bundled", "codex-app-tools@openai-bundled"],
+  "commands": ["lark-notify", "lark-bridge", "claude-turn", "codex-turn", "claude-status", "codex-noop"],
+  "permissions": true
+}

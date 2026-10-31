@@ -116,6 +116,12 @@ test("resolver dispatches only an argument-free registered internal skill", () =
     assert.equal(resolveIntent({ ...intent, project_alias: "unity" }, config, store, {}, registry).type, "reply");
     assert.equal(resolveIntent({ ...intent, content: "run powershell" }, config, store, {}, registry).type, "reply");
     assert.deepEqual(buildRouterContext(config, store, { reply_to: null }, registry).internal_skills, [{
+      name: "off_work",
+      description: "SessionMgr 下班：独立文字命令‘下班’关闭已识别 Agent 客户端；‘下班检查’只读预览",
+    }, {
+      name: "list_agent_sessions",
+      description: "逐条列出本机全部项目的 Claude Code 或 Codex 历史会话，自动分批返回完整列表",
+    }, {
       name: "list_active_agent_sessions",
       description: "查询当前 PC 上正在工作的 Codex、Claude Code 和网关 Session",
     }, {
@@ -257,6 +263,8 @@ test("resolver dispatches only closed CC Switch read actions", () => {
 test("internal skill descriptors expose only registered fixed skills", () => {
   const registry = createInternalSkillRegistry({});
   assert.deepEqual(registry.descriptors().map((entry) => entry.name), [
+    "off_work",
+    "list_agent_sessions",
     "list_active_agent_sessions",
     "inspect_agent_workspace",
     "stop_agent_session",

@@ -1,7 +1,14 @@
 import { randomUUID } from "node:crypto";
-import { loadClaudeEnvironment } from "../config.mjs";
+import { loadClaudeEnvironment, validateClaudeExecutionMode } from "../config.mjs";
 import { runProcess } from "../process-utils.mjs";
 import { sanitizeText } from "../sanitize.mjs";
+
+const WORKER_PROMPT = [
+  "你是飞书网关的任务执行器，消息路由已经完成。请使用当前可用工具执行用户任务。",
+  "当前工作目录是任务的初始目录，不是文件访问沙箱；可按任务需要访问其他目录、运行终端命令和使用已配置的 MCP、技能。",
+  "以本次实际提供的工具和权限为准，不要沿用旧对话中‘只有文件工具’的能力判断。",
+  "若遇到真实的系统权限、缺少软件或服务未启动问题，请检查并准确报告原因。",
+].join("\n");
 
 function parseResult(stdout) {
   const payload = JSON.parse(stdout);
@@ -13,11 +20,12 @@ function parseResult(stdout) {
 }
 
 export class ClaudeExecutor {
-  constructor({ executable, model, timeoutMs, summaryLength = 500, beforeRun = null, beforeResume = null, runProcessImpl = runProcess }) {
+  constructor({ executable, model, timeoutMs, summaryLength = 500, executionMode = "restricted", beforeRun = null, beforeResume = null, runProcessImpl = runProcess }) {
     this.executable = executable;
     this.model = model;
     this.timeoutMs = timeoutMs;
     this.summaryLength = summaryLength;
+    this.executionMode = validateClaudeExecutionMode(executionMode);
     this.beforeRun = beforeRun;
     this.beforeResume = beforeResume;
     this.runProcess = runProcessImpl;
@@ -42,16 +50,27 @@ export class ClaudeExecutor {
         throw error;
       }
     }
-    const args = [
-      "-p", content,
-      "--output-format", "json",
-      "--model", this.model,
+    const permissionArgs = this.executionMode === "full_access" ? [
+      "--tools", "default",
+      "--permission-mode", "bypassPermissions",
+      "--setting-sources", "user,project,local",
+      "--settings", JSON.stringify({ enableAllProjectMcpServers: true }),
+      // Resumed sessions must rebuild the old restricted system prompt.
+      "--system-prompt-snapshot", "off",
+      "--append-system-prompt", WORKER_PROMPT,
+    ] : [
       "--restricted",
       "--tools", "Read,Edit,Write,Glob,Grep",
       "--permission-mode", "acceptEdits",
       "--setting-sources", "local",
       "--strict-mcp-config",
       "--disable-slash-commands",
+    ];
+    const args = [
+      "-p", content,
+      "--output-format", "json",
+      "--model", this.model,
+      ...permissionArgs,
       "--name", session.name,
     ];
     if (session.native_id) args.push("--resume", nativeId);
@@ -59,7 +78,7 @@ export class ClaudeExecutor {
 
     const result = await this.runProcess(this.executable, args, {
       cwd: session.project_path,
-      env: loadClaudeEnvironment(),
+      env: loadClaudeEnvironment({ executionMode: this.executionMode }),
       timeoutMs: this.timeoutMs,
       signal,
     });

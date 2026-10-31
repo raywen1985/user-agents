@@ -14,14 +14,15 @@ function temporary(prefix) {
 
 function createCodexHistory(root, id, name, cwd, status = "completed") {
   fs.mkdirSync(root, { recursive: true });
+  fs.mkdirSync(path.join(root, "thread-writer-locks"), { recursive: true });
   fs.writeFileSync(path.join(root, "session_index.jsonl"), `${JSON.stringify({ id, thread_name: name, updated_at: "2026-10-16T00:00:00Z" })}\n`);
   const history = new DatabaseSync(path.join(root, "thread_history_1.sqlite"));
   history.exec("CREATE TABLE thread_turns (thread_id TEXT, turn_id TEXT, rollout_ordinal INTEGER, status TEXT, started_at INTEGER)");
   history.prepare("INSERT INTO thread_turns VALUES (?, ?, ?, ?, ?)").run(id, "turn-1", 1, status, 100);
   history.close();
   const state = new DatabaseSync(path.join(root, "state_1.sqlite"));
-  state.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, cwd TEXT, updated_at_ms INTEGER)");
-  state.prepare("INSERT INTO threads VALUES (?, ?, ?, ?)").run(id, name, cwd, 200);
+  state.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, cwd TEXT, updated_at_ms INTEGER, thread_source TEXT, source TEXT, archived INTEGER)");
+  state.prepare("INSERT INTO threads VALUES (?, ?, ?, ?, 'user', 'cli', 0)").run(id, name, cwd, 200);
   state.close();
 }
 
@@ -38,6 +39,36 @@ test("collects bounded Codex historical metadata and latest turn state", async (
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("archived native threads stay discoverable but cannot pass catalog or final resume checks", async () => {
+  const root = temporary("codex-archive-"), id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  try {
+    createCodexHistory(root, id, "Archived", fs.realpathSync.native(root));
+    const state = new DatabaseSync(path.join(root, "state_1.sqlite"));
+    state.prepare("UPDATE threads SET archived=1 WHERE id=?").run(id); state.close();
+    const native = await collectCodexHistory({ codexRoot: root });
+    assert.equal(native.records[0].archived, true);
+    const options = { codexRoot: root, executor: "codex", probe: async ({ locks }) => ({ locks: new Map(locks.map(item => [item.id, { state: "free" }])) }) };
+    const catalog = await buildSessionCatalog(options);
+    assert.equal(catalog.complete, true); assert.equal(catalog.candidates[0].capability, "archived");
+    assert.deepEqual(await revalidateNativeCandidate({ ...catalog.candidates[0], archived: false, capability: "ready" }, options), { ok: false, reason: "archived" });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Gateway-only native references distinguish missing records from incomplete scans", async () => {
+  const root = temporary("native-missing-"), store = new Store(path.join(root, "gateway.sqlite"));
+  try {
+    const project = { alias: "work", path: fs.realpathSync.native(root) };
+    const session = store.createSession({ executor: "codex", projectAlias: project.alias, projectPath: project.path,
+      nativeId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", name: "Lost native" });
+    store.updateSession(session.id, { status: "completed" });
+    for (const complete of [true, false]) {
+      const catalog = await buildSessionCatalog({ config: { projects: [project] }, executor: "codex", store,
+        collectCodex: async () => ({ complete, records: [] }) });
+      assert.equal(catalog.candidates[0].capability, complete ? "native_missing" : "snapshot_incomplete");
+    }
+  } finally { store.close(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test("collects Claude title and verifies project from envelope metadata", async () => {
@@ -83,6 +114,7 @@ test("catalog merges a gateway session with its native record and fuzzy matches 
     const options = {
       config, store, executor: "codex", project, sessionName: "资源泄漏排查",
       collectCodex, collectClaudeOwners: async () => new Set(),
+      probe: async ({ locks }) => ({ locks: new Map(locks.map(lock => [lock.id, { state: "free" }])), processes: new Map() }),
     };
     const catalog = await buildSessionCatalog(options);
     assert.equal(catalog.candidates.length, 1);
@@ -139,6 +171,7 @@ test("catalog keeps a valid Codex cwd outside configured overrides", async () =>
   try {
     const result = await buildSessionCatalog({
       config: { projects: [], excludedRoots: [] }, store, executor: "codex",
+      probe: async ({ locks }) => ({ locks: new Map(locks.map(lock => [lock.id, { state: "free" }])), processes: new Map() }),
       collectCodex: async () => ({ complete: true, records: [{
         provider: "codex", executor: "codex", nativeId: id, sessionId: id,
         name: "Unregistered", aliases: [], cwd: projectPath, updatedAt: 10,
@@ -282,7 +315,7 @@ test("Codex catalog treats stale in-progress history according to the writer loc
   const scenarios = [
     ["missing", false, "ready", true],
     ["free", false, "ready", true],
-    ["held", true, "ready", true],
+    ["held", true, "busy", true],
     ["accessDenied", null, null, false],
     ["error", null, null, false],
   ];

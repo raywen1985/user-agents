@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createAgentWorkspaceOverview } from "../src/agent-workspace-overview.mjs";
+import { createAgentWorkspaceOverview, collectWorkspaceSnapshot } from "../src/agent-workspace-overview.mjs";
 
 const CLAUDE_ID = "11111111-1111-4111-8111-111111111111";
 const CODEX_ID = "22222222-2222-4222-8222-222222222222";
@@ -147,6 +147,29 @@ test("gateway identity remains visible while unverified ownership stays hidden",
   assert.match(text, /项目：归属不可用/);
   assert.doesNotMatch(text, /secret|stored-path/i);
   assert.match(text, /恢复：不可用/);
+});
+
+test("observed native project paths remain visible without granting resume authority", async () => {
+  const other = `${PROJECT.path}-other`;
+  const record = candidate({ capability: "project_unverified", authority: null, projectPath: null,
+    project: null, observedProjects: [PROJECT.path, other] });
+  const catalogResult = catalog({ candidates: [record], projects: [] });
+  const snapshot = await collectWorkspaceSnapshot({ buildCatalog: async () => catalogResult,
+    collectActive: async () => active({ records: [] }) });
+  assert.equal(snapshot.sessions[0].ownerAvailable, false);
+  assert.equal(snapshot.sessions[0].resumeCapability, "unavailable");
+  assert.equal(snapshot.sessions[0].projectPath, null);
+  assert.equal(catalogResult.projects.length, 0);
+  assert.equal(snapshot.projects.length, 2);
+  assert.ok(snapshot.projects.every(project => project.sessions.length === 1 && project.authorities.length === 0));
+  const inspect = skill({ catalogResult, activeResult: active({ records: [] }) });
+  const text = await inspect({ overviewScope: "all" });
+  assert.match(text, /路径未知 0 \| 涉及多个路径 1/);
+  assert.match(text, /项目计数可能重叠/);
+  assert.ok(text.includes(PROJECT.path) && text.includes(other));
+  const detail = await inspect({ overviewScope: "session", sessionQuery: record.nativeId });
+  assert.match(detail, /续接归属未验证/);
+  assert.ok(detail.includes(other));
 });
 
 test("failed activity evidence reports unknown instead of idle", async () => {

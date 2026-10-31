@@ -12,13 +12,14 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'install-support.ps1')
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+$sessionMgrRoot = Assert-SessionMgrDependency $projectRoot
 $taskName = 'LarkClaudeGateway'
 $executables = Get-InstalledExecutables ([ordered]@{
     Node = $NodePath; LarkCli = $LarkCliPath; Claude = $ClaudePath; Ffmpeg = $FfmpegPath; Svn = $SvnPath
 })
 
 if ($DiscoveryOnly) {
-    [pscustomobject]@{ projectRoot = $projectRoot; executables = $executables } | ConvertTo-Json -Depth 5
+    [pscustomobject]@{ projectRoot = $projectRoot; sessionMgrRoot = $sessionMgrRoot; executables = $executables } | ConvertTo-Json -Depth 5
     exit 0
 }
 

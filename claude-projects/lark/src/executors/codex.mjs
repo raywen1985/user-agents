@@ -193,7 +193,9 @@ export class CodexExecutor {
       if (session.native_id && this.beforeResume) {
         const guarded = await this.beforeResume(session);
         if (!guarded?.ok) {
-          const error = new Error(guarded?.reason === "busy" ? "原生 Codex Session 正在使用中。" : "无法安全验证原生 Codex Session。");
+          const error = new Error(guarded?.reason === "busy" ? "原生 Codex Session 正在使用中。"
+            : guarded?.reason === "archived" ? "原生 Codex Session 已归档，请先取消归档后重试。"
+              : guarded?.reason === "native_missing" ? "原生 Codex Session 历史已不存在，无法续接。" : "无法安全验证原生 Codex Session。");
           error.code = guarded?.reason || "snapshot_incomplete";
           throw error;
         }

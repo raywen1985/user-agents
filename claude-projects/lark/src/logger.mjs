@@ -3,10 +3,15 @@ import os from "node:os";
 import path from "node:path";
 import { projectRoot } from "./config.mjs";
 
-let logDirectory = path.join(process.env.LOCALAPPDATA || os.tmpdir(), "lark-claude");
+const testing = Boolean(process.env.NODE_TEST_CONTEXT);
+let logDirectory = process.env.LARK_GATEWAY_LOG_DIR || (testing
+  ? fs.mkdtempSync(path.join(os.tmpdir(), "lark-gateway-test-logs-"))
+  : path.join(process.env.LOCALAPPDATA || os.tmpdir(), "lark-claude"));
+if (testing) process.env.LARK_GATEWAY_LOG_DIR = logDirectory;
 try {
   fs.mkdirSync(logDirectory, { recursive: true });
 } catch {
+  if (testing || process.env.LARK_GATEWAY_LOG_DIR) throw new Error("Explicit Gateway log directory is unavailable");
   logDirectory = path.join(projectRoot, "logs");
   fs.mkdirSync(logDirectory, { recursive: true });
 }

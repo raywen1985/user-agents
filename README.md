@@ -103,11 +103,15 @@ git clone https://github.com/raywen1985/user-agents.git $AgentsRoot
 
 `hooks/lark-notify.ps1` 处理通知内容。Claude Code 通过 Hook 调用，Codex 通过 `Invoke-CodexNotifyBridge.ps1` 接入原生 `notify`，仓库自有的旧 Codex 通知 Hook 会在迁移时被禁用，避免重复发送。
 
+新版通知支持使用飞书“回复”直接输入后续任务，由运行中的 Gateway 继续通知对应的原生 Session，无需重复会话名。旧通知不补建绑定；使用方法与占用限制见 [回复会话通知](claude-projects/lark/README.md#回复会话通知)。
+
 安装 `LarkNotifyBootstrap` 计划任务后，系统会在 Windows 用户登录时及每 10 分钟检查并修复这两条配置链。该机制不恢复 lark-cli 登录、应用权限或任何凭据。
 
 ### 飞书远程网关
 
 `claude-projects/lark/` 通过飞书私聊创建或续接 Claude Code 与 Codex Session。它支持确定性 Session 名称路由、候选选择、短时上下文、语音消息、活动 Session 查询、基于不透明停止 ID 的精确停止，以及 CCSwitch 状态和已观察用量的只读查询。
+
+项目/会话概况、正在工作的 Session 和 Claude 历史读取统一由 [SessionMgr](skills/session-mgr/SKILL.md) 维护。Gateway 直接复用其模块；部署和迁移时同时保留 `skills/session-mgr/`，飞书查询指令保持兼容。
 
 网关不会把消息中的任意路径直接当作工作目录，不会用模糊名称自动选择 Session，也不会把 CCSwitch 查询扩展为配置或 Provider 管理。安装和完整安全边界见 [网关说明](claude-projects/lark/README.md)，日常运维见 [飞书远程控制手册](LARK-AGENT-GATEWAY-GUIDE.md)。
 

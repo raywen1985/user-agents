@@ -9,6 +9,21 @@ function Assert([bool]$Condition, [string]$Message) {
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ('lark-install-test-' + [Guid]::NewGuid().ToString('N'))
 try {
+    $portableGateway = Join-Path $root 'portable/claude-projects/lark'
+    $portableSkill = Join-Path $root 'portable/skills/session-mgr'
+    $dependencyRejected = $false
+    try { Assert-SessionMgrDependency $portableGateway | Out-Null } catch { $dependencyRejected = $_.Exception.Message -match 'SessionMgr dependency' }
+    Assert $dependencyRejected 'missing shared dependency was accepted'
+    foreach ($relative in @('SKILL.md', 'scripts/claude-reader.mjs', 'scripts/session-list.mjs', 'scripts/harnesses.mjs',
+        'scripts/off-work.mjs', 'scripts/off-work-windows.ps1',
+        'scripts/codex-store.mjs', 'scripts/session-store.mjs', 'scripts/discovery/agent-workspace-overview.mjs',
+        'scripts/discovery/session-catalog.mjs', 'scripts/discovery/active-agent-sessions.mjs',
+        'scripts/discovery/claude-history-worker.mjs', 'scripts/discovery/session-probe.ps1')) {
+        $target = Join-Path $portableSkill $relative
+        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+        [IO.File]::WriteAllText($target, '')
+    }
+    Assert ((Assert-SessionMgrDependency $portableGateway) -eq $portableSkill) 'shared dependency was not resolved relative to Gateway'
     New-Item -ItemType Directory -Path (Join-Path $root '.claude'), (Join-Path $root 'config'), (Join-Path $root 'run') | Out-Null
     $settingsPath = Join-Path $root '.claude\settings.local.json'
     $statePath = Join-Path $root '.claude\install-state.local.json'

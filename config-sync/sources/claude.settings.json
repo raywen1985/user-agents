@@ -1,0 +1,60 @@
+{
+  "autoUpdatesChannel": "latest",
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME": "cc-deepseek-v4.1-flash",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-5",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME": "cc-deepseek-v4.1-flash",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-4-8",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "cc-deepseek-v4.1-flash",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "cc-deepseek-v4.1-flash",
+    "API_TIMEOUT_MS": "3000000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "cc-deepseek-v4.1-flash"
+  },
+  "hooks": {
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "async": true,
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${AGENTS_ROOT}/hooks/lark-notify.ps1\" -Source claude",
+            "timeout": 30,
+            "type": "command"
+          }
+        ],
+        "matcher": "permission_prompt|idle_prompt|agent_needs_input"
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${AGENTS_ROOT}/hooks/lark-notify.ps1\" -Source claude",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"${AGENTS_ROOT}/hooks/lark-notify.ps1\" -Source claude",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  },
+  "includeCoAuthoredBy": false,
+  "model": "haiku",
+  "permissions": {
+    "defaultMode": "auto"
+  },
+  "theme": "dark"
+}

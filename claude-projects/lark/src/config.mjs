@@ -20,7 +20,7 @@ function readOptionalJson(fullPath) {
 const GATEWAY_KEYS = new Set([
   "allowedOpenIds", "recipientOpenId", "maxConcurrentProjects", "routerModel", "workerModel",
   "routerTimeoutMs", "workerTimeoutMs", "summaryLength", "recentSessionLimit",
-  "powershellApprovalMode", "voice", "executables", "codexControl", "installationGeneration",
+  "powershellApprovalMode", "claudeExecutionMode", "voice", "executables", "codexControl", "installationGeneration",
 ]);
 const EXECUTABLE_KEYS = new Set(["node", "larkCli", "claude", "ffmpeg", "svn", "codex"]);
 const VOICE_KEYS = new Set(["enabled", "echoTranscript", "engineType", "maxDurationMs", "maxBytes", "timeoutMs"]);
@@ -147,6 +147,13 @@ export function validateCodexControlConfig(input, {
 
 const SPEECH_ENGINE_TYPES = new Set(["16k_auto"]);
 const POWERSHELL_APPROVAL_MODES = new Set(["review", "always_allow"]);
+const CLAUDE_EXECUTION_MODES = new Set(["restricted", "full_access"]);
+
+export function validateClaudeExecutionMode(value) {
+  const mode = value ?? "restricted";
+  if (!CLAUDE_EXECUTION_MODES.has(mode)) throw new Error(`Unsupported Claude execution mode: ${mode}`);
+  return mode;
+}
 
 export function validatePowerShellApprovalMode(value) {
   const mode = value == null ? "review" : String(value);
@@ -190,6 +197,7 @@ export function loadConfig({ rootPath = projectRoot, configDirectory = path.join
   gateway.codexControl = validateCodexControlConfig(gateway.codexControl);
   gateway.voice = validateVoiceConfig(gateway.voice);
   gateway.powershellApprovalMode = validatePowerShellApprovalMode(gateway.powershellApprovalMode);
+  gateway.claudeExecutionMode = validateClaudeExecutionMode(gateway.claudeExecutionMode);
   for (const [name, executable] of Object.entries(gateway.executables || {})) {
     if (name === "codex") continue;
     gateway.executables[name] = resolveConfiguredPath(executable, rootPath, `Executable ${name}`);
@@ -244,16 +252,20 @@ export function loadConfig({ rootPath = projectRoot, configDirectory = path.join
   return { gateway, projects, projectAliases: aliases, excludedRoots };
 }
 
-export function loadClaudeEnvironment() {
-  const settingsPath = path.join(process.env.USERPROFILE || "", ".claude", "settings.json");
+export function loadClaudeEnvironment({
+  executionMode = "restricted",
+  inheritedEnv = process.env,
+  settingsPath = path.join(inheritedEnv.USERPROFILE || "", ".claude", "settings.json"),
+} = {}) {
+  const fullAccess = validateClaudeExecutionMode(executionMode) === "full_access";
   const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
   const inheritedKeys = ["PATH", "PATHEXT", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "COMSPEC"];
-  const env = {};
+  const env = fullAccess ? { ...inheritedEnv } : {};
   for (const key of inheritedKeys) {
-    if (process.env[key] !== undefined) env[key] = process.env[key];
+    if (inheritedEnv[key] !== undefined) env[key] = inheritedEnv[key];
   }
   for (const [key, value] of Object.entries(settings.env || {})) {
-    if (key.startsWith("ANTHROPIC_") || key === "API_TIMEOUT_MS" || key === "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC") {
+    if (fullAccess || key.startsWith("ANTHROPIC_") || key === "API_TIMEOUT_MS" || key === "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC") {
       env[key] = String(value);
     }
   }

@@ -19,12 +19,14 @@ import { CodexControlManager } from "./codex-control-client.mjs";
 import { loadConfig, projectRoot } from "./config.mjs";
 import { ClaudeExecutor } from "./executors/claude.mjs";
 import { CodexExecutor } from "./executors/codex.mjs";
-import { formatSessionLine, formatSessionMessage } from "./format.mjs";
+import { formatSessionMessage } from "./format.mjs";
 import { buildGatewayHealth, processStartFileTimeToIso } from "./gateway-health.mjs";
-import { classifyInboundMessage, LarkListener, LarkMessenger } from "./lark.mjs";
+import { canAcceptUserMessage, classifyInboundMessage, inboundUnavailableText, LarkListener, LarkMessenger } from "./lark.mjs";
 import { logger } from "./logger.mjs";
 import { createMessageCoordinator } from "./message-coordinator.mjs";
+import { createNotificationReplyHandler, pruneNotificationBindings } from "./notification-replies.mjs";
 import { createInternalSkillRegistry } from "./internal-skills.mjs";
+import { collectSessionList, formatSessionListPages, createSessionListHandler } from "./session-list.mjs";
 import { ReadApprovalPolicy } from "./read-approval-policy.mjs";
 import { RestartCoordinator } from "./restart-coordinator.mjs";
 import { backfillOverrideAuthorities, revalidateProjectAuthority } from "./project-guard.mjs";
@@ -37,6 +39,9 @@ import { createStopAgentSession } from "./stop-agent-session.mjs";
 import { createStopTargetDecorator } from "./stop-targets.mjs";
 import { Store } from "./store.mjs";
 import { parseAudioContent, VoiceTranscriber, voiceFailureText } from "./voice.mjs";
+import { createVoiceReadiness } from "./voice-readiness.mjs";
+import { logLookupFailure, retrySnapshot } from "./lookup-observation.mjs";
+import { createOffWorkSkill, OFF_WORK_BUSY } from "./off-work.mjs";
 
 const config = loadConfig();
 const { gateway } = config;
@@ -94,8 +99,10 @@ const recoveryClaims = store.claimGatewayInstance({
 });
 fs.writeFileSync(pidPath, String(process.pid), { flag: "w" });
 store.recoverInterrupted();
+store.recoverOffWorkRequests();
 const messenger = new LarkMessenger({ executable: gateway.executables.larkCli, recipientOpenId: gateway.recipientOpenId });
 const listener = new LarkListener({ executable: gateway.executables.larkCli });
+const voiceReadiness = createVoiceReadiness({ executable: gateway.executables.larkCli });
 const voice = new VoiceTranscriber({
   executable: gateway.executables.larkCli,
   ffmpegExecutable: gateway.executables.ffmpeg,
@@ -103,6 +110,8 @@ const voice = new VoiceTranscriber({
   maxDurationMs: gateway.voice.maxDurationMs,
   maxBytes: gateway.voice.maxBytes,
   timeoutMs: gateway.voice.timeoutMs,
+  checkScope: () => voiceReadiness.check(),
+  onRecognition: (code, upstreamCode) => { voiceReadiness.record(code, upstreamCode); updateHealth({ voice: voiceReadiness.snapshot() }); },
 });
 const router = new ClaudeRouter({ executable: gateway.executables.claude, model: gateway.routerModel, timeoutMs: gateway.routerTimeoutMs });
 const codexExecutable = createCodexExecutableResolver({
@@ -159,8 +168,9 @@ const scheduler = new Scheduler({
       model: gateway.workerModel,
       timeoutMs: gateway.workerTimeoutMs,
       summaryLength: gateway.summaryLength,
+      executionMode: gateway.claudeExecutionMode,
       beforeRun: projectGuard,
-      beforeResume: (session) => revalidateGatewaySession(session, { config, store, codexRoot, claudeRoot }),
+      beforeResume: (session) => retrySnapshot(() => revalidateGatewaySession(session, { config, store, codexRoot, claudeRoot })),
     }),
     codex: new CodexExecutor({
       resolveExecutable: () => codexExecutable.resolve(),
@@ -170,7 +180,7 @@ const scheduler = new Scheduler({
       readApprovalPolicy,
       powershellApprovalMode: gateway.powershellApprovalMode,
       beforeRun: projectGuard,
-      beforeResume: (session) => revalidateGatewaySession(session, { config, store, codexRoot, claudeRoot }),
+      beforeResume: (session) => retrySnapshot(() => revalidateGatewaySession(session, { config, store, codexRoot, claudeRoot })),
     }),
   },
   onMessage: sendSession,
@@ -224,6 +234,15 @@ const inspectAgentWorkspace = createAgentWorkspaceOverview({
 });
 
 const internalSkills = createInternalSkillRegistry({
+  off_work: createOffWorkSkill({ store, scheduler,
+    sendProgress: (text, messageId) => sendGlobal(text, `off-work-start-${messageId}`),
+  }),
+  list_agent_sessions: async ({ overviewExecutor }) => {
+    return formatSessionListPages(await collectSessionList({
+      harness: overviewExecutor || "all", claudeRoot, codexRoot,
+      resolveCodexBin: async () => (await codexExecutable.resolve()).executable,
+    }));
+  },
   list_active_agent_sessions: async ({ gatewayActivities, gatewayTruncated }) => listActiveAgentSessions({
     gatewayActivities,
     gatewayTruncated,
@@ -255,6 +274,14 @@ const {
   handleCandidateNavigation,
 } = sessionLookup;
 const messageCoordinator = createMessageCoordinator({ config, store, router, internalSkills });
+const handleSessionList = createSessionListHandler({
+  store, flushOutbox,
+  query: overviewExecutor => internalSkills.dispatch("list_agent_sessions", { overviewExecutor }),
+});
+const handleNotificationReply = createNotificationReplyHandler({
+  config, store, scheduler, findNamedSession, revalidateNativeCandidate, codexRoot, claudeRoot,
+  sendGlobal, queueCommitted: sessionLookup.queueCommitted,
+});
 
 for (const claim of recoveryClaims) {
   const operation = store.getStopOperation(claim.operationId);
@@ -264,7 +291,7 @@ for (const request of store.listStopRequestsMissingOutbox()) {
   if (["completed", "uncertain"].includes(request.state)) store.repairStopRequestOutbox(request);
 }
 
-const healthState = {};
+const healthState = { claudeExecutionMode: gateway.claudeExecutionMode };
 const healthIdentity = Object.freeze({
   pid: process.pid,
   procStart: selfStart,
@@ -284,11 +311,20 @@ function updateHealth(extra = {}) {
 }
 
 async function handleResolved(resolved, message) {
+  if (scheduler.offWork && ['notification_reply', 'lookup', 'lookup_new', 'lookup_unnamed', 'candidate_reply', 'enqueue'].includes(resolved.type)) {
+    return sendGlobal(OFF_WORK_BUSY, `off-work-busy-${message.message_id}`);
+  }
+  if (resolved.type === "notification_reply") return handleNotificationReply(resolved, message);
   if (resolved.type === "reply") return sendGlobal(resolved.text, `reply-${message.message_id}`);
   if (resolved.type === "help" || resolved.type === "unknown") {
     return sendGlobal("可以自然语言要求 Codex 或 Claude 查找并继续本机历史 Session，或在已发现工程中新建任务；也可以查看、取消、批准/拒绝，查询本机 Agent 项目与 Session 概况，查询或精确停止当前工作的 Agent Session，以及只读查询 CC Switch 的状态、Provider、健康、路由和用量。也可以直接发送语音消息，网关会自动转写后执行。", `help-${message.message_id}`);
   }
   if (resolved.type === "internal_skill") {
+    if (resolved.skillName === 'off_work') {
+      const text = await internalSkills.dispatch('off_work', { messageId: message.message_id, execute: resolved.execute });
+      return sendGlobal(text, `off-work-result-${message.message_id}`);
+    }
+    if (resolved.skillName === "list_agent_sessions") return handleSessionList(resolved.overviewExecutor, message.message_id);
     if (resolved.skillName === "ccswitch") {
       const text = await internalSkills.dispatch("ccswitch", Object.freeze({
         ccswitchAction: resolved.ccswitchAction,
@@ -323,11 +359,6 @@ async function handleResolved(resolved, message) {
       return flushOutbox();
     }
     return sendGlobal(result, `internal-${resolved.skillName}-${message.message_id}`);
-  }
-  if (resolved.type === "list") {
-    const sessions = store.listSessions(gateway.recentSessionLimit);
-    const text = sessions.length ? sessions.map(formatSessionLine).join("\n") : "暂无 Session。";
-    return sendGlobal(text, `list-${message.message_id}`);
   }
   if (resolved.type === "lookup") return handleNamedLookup(resolved, message);
   if (resolved.type === "lookup_new") return handleNewLookup(resolved, message);
@@ -380,6 +411,13 @@ async function handleResolved(resolved, message) {
       return sessionLookup.queueCommitted(committed);
     }
     const session = resolved.session;
+    if (session.native_id) {
+      const checked = await retrySnapshot(() => revalidateGatewaySession(session, { config, store, codexRoot, claudeRoot }));
+      if (!checked.ok) {
+        logLookupFailure({ messageId: message.message_id, executor: session.executor, reason: checked.reason });
+        return sendGlobal(lookupFailureText(checked.reason), `continue-${checked.reason}-${message.message_id}`);
+      }
+    }
     if (!scheduler.canEnqueue(session.id)) {
       return sendSession(session, "Session 正在停止，请稍后重试。", `stopping-${message.message_id}`);
     }
@@ -415,15 +453,7 @@ async function handleResolved(resolved, message) {
 
 let shuttingDown = false;
 function canAcceptInbound(message) {
-  if (message.chat_type !== "p2p") return false;
-  const inboundType = classifyInboundMessage(message.message_type, message.content);
-  if (inboundType === "unsupported") return false;
-  if (message.sender_type && message.sender_type !== "user") return false;
-  if (!gateway.allowedOpenIds.includes(message.sender_id)) {
-    logger.warn("忽略未授权的飞书发送者", { senderId: message.sender_id });
-    return false;
-  }
-  return !(!gateway.voice.enabled && inboundType === "audio") && Boolean(message.message_id && message.content);
+  return canAcceptUserMessage(message, gateway.allowedOpenIds);
 }
 
 function persistFencedMessage(message) {
@@ -436,9 +466,10 @@ async function handleEvent(message, { replay = false } = {}) {
   if (!canAcceptInbound(message)) return;
   const inboundType = classifyInboundMessage(message.message_type, message.content);
   if (!replay && !store.acceptInbox(message)) return;
-  if (inboundType === "post_resource") {
+  const unavailableText = inboundUnavailableText(message, gateway.voice.enabled);
+  if (unavailableText) {
     try {
-      await sendGlobal("此条富文本消息包含图片或附件，无法作为远程指令处理；请改发纯文本消息。", `post-resource-${message.message_id}`);
+      await sendGlobal(unavailableText, `unsupported-message-${message.message_id}`);
       store.markInbox(message.message_id, "processed");
     } catch (error) {
       store.markInbox(message.message_id, "failed");
@@ -458,7 +489,7 @@ async function handleEvent(message, { replay = false } = {}) {
       transcript = await voice.transcribe({ messageId: message.message_id, ...audio });
     } catch (error) {
       store.markInbox(message.message_id, "failed");
-      logger.warn("语音消息识别失败", { messageId: message.message_id, code: error.code || "VOICE_RECOGNITION_FAILED" });
+      logger.warn("语音消息识别失败", { messageId: message.message_id, code: error.code || "VOICE_RECOGNITION_FAILED", upstreamCode: error.upstreamCode || null });
       await sendGlobal(voiceFailureText(error), `voice-error-${message.message_id}`);
       return;
     }
@@ -488,6 +519,13 @@ let healthTimer;
 let outboxTimer;
 let queueTimer;
 let restartTimer;
+let bindingCleanupTimer;
+function cleanupBindings() {
+  try {
+    const result = pruneNotificationBindings();
+    if (result.removed) logger.info("通知绑定清理", result);
+  } catch { logger.warn("通知绑定目录无法安全清理", { reason: "binding_cleanup_unavailable" }); }
+}
 async function shutdown(signal, health = {}) {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -497,6 +535,7 @@ async function shutdown(signal, health = {}) {
   if (outboxTimer) clearInterval(outboxTimer);
   if (queueTimer) clearInterval(queueTimer);
   if (restartTimer) clearInterval(restartTimer);
+  if (bindingCleanupTimer) clearInterval(bindingCleanupTimer);
   updateHealth({ stopping: true, ...health });
   store.markGatewayInstanceDraining(ownerEpoch);
   store.releaseOwnedPendingStops(ownerEpoch);
@@ -534,6 +573,10 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("exit", () => { try { if (Number(fs.readFileSync(pidPath, "utf8")) === process.pid) fs.unlinkSync(pidPath); } catch {} });
 
 await listener.start();
+if (gateway.voice.enabled) updateHealth({ voice: await voiceReadiness.check() });
+cleanupBindings();
+bindingCleanupTimer = setInterval(cleanupBindings, 60 * 60 * 1000);
+bindingCleanupTimer.unref?.();
 await replayPendingInbox();
 if (recoveredQueuedTasks.length) scheduler.drain();
 updateHealth({
@@ -555,4 +598,4 @@ restartTimer = setInterval(() => {
 }, 1000);
 restartTimer.unref?.();
 await flushOutbox();
-logger.info("Lark Agent Gateway 已启动", { pid: process.pid, log: logger.path });
+logger.info("Lark Agent Gateway 已启动", { pid: process.pid, log: logger.path, claudeExecutionMode: gateway.claudeExecutionMode });

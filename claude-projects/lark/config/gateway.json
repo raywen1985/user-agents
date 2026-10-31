@@ -11,6 +11,7 @@
   "summaryLength": 500,
   "recentSessionLimit": 12,
   "powershellApprovalMode": "always_allow",
+  "claudeExecutionMode": "full_access",
   "voice": {
     "enabled": true,
     "echoTranscript": true,

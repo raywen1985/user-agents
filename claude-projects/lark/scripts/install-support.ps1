@@ -1,6 +1,20 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+function Assert-SessionMgrDependency([string]$ProjectRoot) {
+    $skillRoot = [IO.Path]::GetFullPath((Join-Path $ProjectRoot '../../skills/session-mgr'))
+    foreach ($relative in @('SKILL.md', 'scripts/claude-reader.mjs', 'scripts/session-list.mjs', 'scripts/harnesses.mjs',
+        'scripts/off-work.mjs', 'scripts/off-work-windows.ps1',
+        'scripts/codex-store.mjs', 'scripts/session-store.mjs', 'scripts/discovery/agent-workspace-overview.mjs',
+        'scripts/discovery/session-catalog.mjs', 'scripts/discovery/active-agent-sessions.mjs',
+        'scripts/discovery/claude-history-worker.mjs', 'scripts/discovery/session-probe.ps1')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $skillRoot $relative) -PathType Leaf)) {
+            throw "SessionMgr dependency is incomplete. Install the full skills/session-mgr directory beside claude-projects/lark before starting Gateway. Missing: $relative"
+        }
+    }
+    $skillRoot
+}
+
 function Get-Sha256([string]$Path) {
     $stream = [IO.File]::OpenRead($Path)
     $algorithm = [Security.Cryptography.SHA256]::Create()

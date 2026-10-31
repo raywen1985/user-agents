@@ -43,6 +43,7 @@ function resolveSession(intent, config, store, message) {
 }
 
 export function resolveIntent(intent, config, store, message, internalSkills = null) {
+  if (intent.skill_name === 'off_work') return { type: 'reply', text: '下班只接受独立文字命令：“下班检查”或“下班”。' };
   const overviewFields = ["overview_scope", "overview_executor", "project_query", "session_query"];
   if (intent.needs_clarification || intent.action === "clarify") {
     return { type: "reply", text: intent.clarification || "请补充执行器、项目或 Session。" };
@@ -53,19 +54,34 @@ export function resolveIntent(intent, config, store, message, internalSkills = n
     return { type: "reply", text: "内部技能查询不能与项目或 Session 操作混用。" };
   }
   if (["help", "unknown"].includes(intent.action)) return { type: intent.action };
-  if (intent.action === "list") return { type: "list" };
+  if (intent.action === "list") {
+    if (["project_alias", "session_ref", "session_name", "request_ref", "content"].some(field => intent[field] != null)
+      || intent.executor != null && !["claude", "codex"].includes(intent.executor)) {
+      return { type: "reply", text: "请单独发送会话列表查询；全部项目可使用“列出所有 Claude Code 会话”。" };
+    }
+    return { type: "internal_skill", skillName: "list_agent_sessions", overviewExecutor: intent.executor || null };
+  }
 
   if (intent.skill_name !== "ccswitch"
     && (intent.ccswitch_action != null || intent.usage_period != null)) {
     return { type: "reply", text: "CC Switch 查询参数不能用于其他操作，请分开发送。" };
   }
-  if (intent.skill_name !== "inspect_agent_workspace" && overviewFields.some((field) => intent[field] != null)) {
+  if (!["inspect_agent_workspace", "list_agent_sessions"].includes(intent.skill_name) && overviewFields.some((field) => intent[field] != null)) {
     return { type: "reply", text: "项目与 Session 概况参数不能用于其他操作，请分开发送。" };
   }
 
   if (intent.action === "internal_skill") {
     const commonForbidden = ["executor", "project_alias", "session_name", "request_ref", "content", "clarification"];
     if (!internalSkills?.has?.(intent.skill_name)) return { type: "unknown" };
+    if (intent.skill_name === "list_agent_sessions") {
+      const forbidden = [...commonForbidden, "session_ref", "ccswitch_action", "usage_period", "project_query", "session_query"];
+      if (forbidden.some(field => intent[field] != null)
+        || intent.overview_scope != null && intent.overview_scope !== "all"
+        || intent.overview_executor != null && !["claude", "codex"].includes(intent.overview_executor)) {
+        return { type: "reply", text: "请将全部会话列表查询和其他操作分开发送。" };
+      }
+      return { type: "internal_skill", skillName: intent.skill_name, overviewExecutor: intent.overview_executor || null };
+    }
     if (intent.skill_name === "inspect_agent_workspace") {
       const forbidden = [...commonForbidden, "session_ref", "ccswitch_action", "usage_period"];
       if (forbidden.some((field) => intent[field] != null)) {

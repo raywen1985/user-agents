@@ -83,6 +83,10 @@ export class Store {
         status TEXT NOT NULL DEFAULT 'received',
         received_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS off_work_requests (
+        message_id TEXT PRIMARY KEY, state TEXT NOT NULL, result_json TEXT, reply_text TEXT,
+        inbox_cutoff INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
         executor TEXT NOT NULL CHECK (executor IN ('codex', 'claude')),
@@ -469,6 +473,39 @@ export class Store {
     `).run(event.message_id, event.sender_id, event.chat_id, event.reply_to || null, event.content,
       event.message_type || "text", now());
     return Number(result.changes) === 1;
+  }
+
+  claimOffWork(messageId) {
+    return this.#transaction(() => {
+      const existing = this.db.prepare('SELECT * FROM off_work_requests WHERE message_id=?').get(messageId);
+      if (existing) return { ownsExecution: false, ...existing };
+      this.db.prepare(`INSERT INTO off_work_requests(message_id,state,inbox_cutoff,created_at,updated_at)
+        VALUES (?,'running',(SELECT COALESCE(MAX(rowid),0) FROM inbox),?,?)`).run(messageId, now(), now());
+      this.db.prepare(`UPDATE sessions SET status='cancelled',last_summary='下班取消排队任务',updated_at=?
+        WHERE id IN (SELECT session_id FROM tasks WHERE status='queued')`).run(now());
+      this.db.prepare("UPDATE tasks SET status='cancelled',result='下班取消排队任务',updated_at=? WHERE status='queued'").run(now());
+      return { ownsExecution: true, message_id: messageId, state: 'running' };
+    });
+  }
+
+  finishOffWork(messageId, result, text) {
+    this.db.prepare(`UPDATE off_work_requests SET state='finished',result_json=?,reply_text=?,
+      inbox_cutoff=(SELECT COALESCE(MAX(rowid),0) FROM inbox),updated_at=? WHERE message_id=?`)
+      .run(JSON.stringify(result), text, now(), messageId);
+  }
+
+  recoverOffWorkRequests() {
+    const requests = this.db.prepare("SELECT message_id FROM off_work_requests WHERE state='running'").all();
+    for (const request of requests) this.finishOffWork(request.message_id, { status: 'uncertain', released: false },
+      '下班执行期间网关中断，无法确认最终结果；不会自动再次关闭客户端。请发送“下班检查”。');
+    return requests.length;
+  }
+
+  taskBlockedByOffWork(messageId) {
+    if (this.taskAdmissionBlocked) return true;
+    if (!messageId) return false;
+    return Boolean(this.db.prepare(`SELECT 1 FROM inbox WHERE message_id=? AND rowid <=
+      (SELECT MAX(inbox_cutoff) FROM off_work_requests)`).get(messageId));
   }
 
   markInbox(messageId, status) {
@@ -970,9 +1007,22 @@ export class Store {
     return { ok: true, session, created: true };
   }
 
-  commitNamedTask({
+  commitNamedTask(request) {
+    return this.#commitTask(request);
+  }
+
+  commitNotificationTask(request) {
+    const candidate = request.candidate;
+    if (!candidate || candidate.executor !== request.executor
+      || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(candidate.nativeId || "")
+      || request.action !== "continue") return { ok: false, reason: "stale_target" };
+    return this.#commitTask(request, true);
+  }
+
+  #commitTask({
     messageId, candidate = null, executor, project, name, content, action = "continue", approvalProfile = null,
-  }) {
+  }, nativeReply = false) {
+    if (this.taskBlockedByOffWork(messageId)) return { ok: false, reason: 'off_work' };
     return this.#transaction(() => {
       const existingTask = this.db.prepare("SELECT * FROM tasks WHERE message_id=?").get(messageId);
       if (existingTask) {
@@ -980,9 +1030,27 @@ export class Store {
         return { ok: true, session: this.getSession(existingTask.session_id), task: existingTask, repeated: true };
       }
       const taskCandidate = candidate?.kind === "existing-session" ? candidate.candidate : candidate;
+      if (nativeReply) {
+        const nativeConflict = this.db.prepare(`SELECT 1 FROM native_session_claim_conflicts
+          WHERE executor=? AND native_id=? AND resolved_at IS NULL`).get(executor, taskCandidate.nativeId);
+        const mapped = this.db.prepare("SELECT id FROM sessions WHERE executor=? AND lower(native_id)=?")
+          .all(executor, taskCandidate.nativeId);
+        if (nativeConflict || mapped.length > 1) return { ok: false, reason: "identity_conflict" };
+        if (taskCandidate.gatewayId && mapped[0]?.id !== taskCandidate.gatewayId) return { ok: false, reason: "stale_target" };
+      }
       const resolved = this.#resolveTaskSession(taskCandidate, { executor, project, name });
       if (!resolved.ok) return resolved;
       const nameClaim = this.#claimName(resolved.session);
+      if (!nameClaim.ok && nativeReply && ["name_in_use", "name_claim_conflict"].includes(nameClaim.reason)) {
+        const key = normalizeExactSessionName(resolved.session.name).key;
+        const existing = this.db.prepare(`SELECT session_ids_json FROM session_exact_name_claim_conflicts
+          WHERE executor=? AND exact_name=?`).get(executor, key);
+        const ids = [...new Set([...parseJson(existing?.session_ids_json, []), nameClaim.sessionId, resolved.session.id].filter(Boolean))].sort();
+        this.db.prepare(`INSERT INTO session_exact_name_claim_conflicts VALUES (?, ?, ?, NULL, ?)
+          ON CONFLICT(executor, exact_name) DO UPDATE SET session_ids_json=excluded.session_ids_json, resolved_at=NULL`)
+          .run(executor, key, JSON.stringify(ids), now());
+        nameClaim.ok = true;
+      }
       if (!nameClaim.ok) {
         if (resolved.created) {
           this.db.prepare("DELETE FROM native_session_claims WHERE session_id=?").run(resolved.session.id);
@@ -1012,6 +1080,7 @@ export class Store {
   }
 
   commitCandidateTask({ candidateSetId, candidatePageId = null, selectionMessageId, selectedIndex, candidate, executor, project, name, content, action = "continue" }) {
+    if (this.taskBlockedByOffWork(selectionMessageId)) return { ok: false, reason: 'off_work' };
     return this.#transaction(() => {
       const set = this.db.prepare("SELECT * FROM session_candidate_sets WHERE id=?").get(candidateSetId);
       if (!set) return { ok: false, reason: "selection_expired" };
@@ -1145,6 +1214,7 @@ export class Store {
   }
 
   createTask({ sessionId, messageId, action, content, approvalProfile = null }) {
+    if (this.taskBlockedByOffWork(messageId)) throw new Error('该请求被下班操作取消，请重新发送任务。');
     const id = shortId("TK");
     const timestamp = now();
     this.db.prepare(`
@@ -1187,6 +1257,10 @@ export class Store {
 
   listTasksByStatus(status) {
     return this.db.prepare("SELECT * FROM tasks WHERE status=? ORDER BY updated_at DESC").all(status);
+  }
+
+  taskForMessage(messageId) {
+    return this.db.prepare("SELECT * FROM tasks WHERE message_id=?").get(messageId) || null;
   }
 
   recoverInterrupted() {
@@ -1266,6 +1340,20 @@ export class Store {
         dedupe_key, text, session_id, candidate_set_id, candidate_page_id, approval_id, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(dedupeKey, text, sessionId, candidateSetId, candidatePageId, approvalId, now());
+  }
+
+  hasOutboxBatch(key) {
+    return Boolean(this.db.prepare("SELECT id FROM outbox WHERE dedupe_key=?").get(`${key}-page-1`));
+  }
+
+  enqueueOutboxBatch(key, pages) {
+    if (!pages.length) throw new Error("Outbox batch must contain at least one page");
+    return this.#transaction(() => {
+      // Keep the first snapshot intact when the same inbound message is retried.
+      if (this.hasOutboxBatch(key)) return false;
+      for (const [index, text] of pages.entries()) this.enqueueOutbox(`${key}-page-${index + 1}`, text);
+      return true;
+    });
   }
 
   nextOutbox(timestamp = now()) {

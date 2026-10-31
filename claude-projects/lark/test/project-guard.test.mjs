@@ -38,7 +38,8 @@ test("explicit local overrides backfill and revalidate existing sessions", async
 test("Claude transcript evidence is revalidated against exact cwd", async () => {
   const { root, projectPath, store } = fixture();
   const id = "99999999-9999-4999-8999-999999999999";
-  const sourcePath = path.join(root, `${id}.jsonl`);
+  const sourcePath = path.join(root, "projects", "fixture", `${id}.jsonl`);
+  fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
   fs.writeFileSync(sourcePath, JSON.stringify({ type: "user", sessionId: id, cwd: projectPath }));
   const config = { projects: [], excludedRoots: [] };
   try {

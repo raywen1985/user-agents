@@ -25,7 +25,7 @@
     },
     "skill_name": {
       "type": ["string", "null"],
-      "enum": ["list_active_agent_sessions", "inspect_agent_workspace", "stop_agent_session", "ccswitch", null]
+      "enum": ["list_agent_sessions", "list_active_agent_sessions", "inspect_agent_workspace", "stop_agent_session", "off_work", "ccswitch", null]
     },
     "overview_scope": {
       "type": ["string", "null"],

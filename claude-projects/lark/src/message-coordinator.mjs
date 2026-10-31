@@ -1,8 +1,11 @@
 import { buildRouterContext, resolveIntent } from "./resolver.mjs";
 import { approvalProfileForTypedTask, parseApprovalControl } from "./approval-control.mjs";
 import { parseSessionCommand } from "./session-command-parser.mjs";
+import { parseSessionListQuery } from "./session-list.mjs";
 import { normalizeExactSessionName } from "./session-name-match.mjs";
 import { resolveCandidateSelection } from "./session-lookup-service.mjs";
+import { readNotificationBinding, UNKNOWN_NOTIFICATION_REPLY } from "./notification-replies.mjs";
+import { parseOffWorkCommand } from "./off-work.mjs";
 
 function syntaxError(parsed) {
   const example = parsed.executor === "claude"
@@ -36,8 +39,10 @@ function commandConflict(parsed, replied) {
   return replied.executor !== parsed.executor || !requested || !actual || requested.key !== actual.key;
 }
 
-export function createMessageCoordinator({ config, store, router, internalSkills = null }) {
+export function createMessageCoordinator({ config, store, router, internalSkills = null, notificationBinding = readNotificationBinding }) {
   async function coordinate(message) {
+    const offWork = parseOffWorkCommand(message.content, message.message_type || 'text');
+    if (offWork) return offWork;
     const approval = parseApprovalControl(message.content, message.message_type || "text");
     if (approval?.type === "invalid-approval") {
       return { type: "reply", text: "审批命令格式：批准 RQ-...、拒绝 RQ-...；回复审批消息还可发送“批准同类”或“全部批准”。" };
@@ -54,6 +59,18 @@ export function createMessageCoordinator({ config, store, router, internalSkills
     }
     const parsed = parseSessionCommand(message.content);
 
+    if (message.reply_to && !store.sessionForMessage(message.reply_to) && !store.candidateSetForReply(message.reply_to)) {
+      const notification = await notificationBinding(message);
+      if (notification.kind !== "bound") return { type: "reply", text: notification.kind === "forbidden"
+        ? "该通知不属于当前聊天或发送者，未执行。" : UNKNOWN_NOTIFICATION_REPLY };
+      if (parsed.type === "create-new") return { type: "reply", text: "回复通知用于继续原 Session；新建会话请取消回复后发送 new/新建 命令。" };
+      if (parsed.type === "invalid-command") return { type: "reply", text: syntaxError(parsed) };
+      const command = parsed.type === "continue-or-create" ? parsed : null;
+      const content = command ? command.content : message.content;
+      return { type: "notification_reply", binding: notification.binding, command, content,
+        approvalProfile: approvalProfileForTypedTask(content, message.message_type || "text") };
+    }
+
     if (["number-selection", "page-navigation"].includes(parsed.type)) {
       const selection = resolveCandidateSelection(store, message);
       if (selection.kind === "ambiguous") {
@@ -66,6 +83,9 @@ export function createMessageCoordinator({ config, store, router, internalSkills
         ? { type: "candidate_navigation", binding: selection.binding, direction: parsed.direction }
         : { type: "candidate_reply", binding: selection.binding };
     }
+
+    const sessionList = parseSessionListQuery(message.content);
+    if (sessionList) return sessionList;
 
     if (parsed.type === "invalid-command") return { type: "reply", text: syntaxError(parsed) };
 
@@ -100,6 +120,7 @@ export function createMessageCoordinator({ config, store, router, internalSkills
 
     const context = buildRouterContext(config, store, message, internalSkills);
     const intent = await router.route(message, context);
+    if (intent.skill_name === 'off_work') return { type: 'reply', text: '请单独发送文字“下班检查”查看，或“下班”关闭所有已识别 Agent 客户端。' };
     if (["approve", "reject"].includes(intent.action)) {
       return { type: "reply", text: "审批只接受明确的文字命令：批准 RQ-... 或拒绝 RQ-...。" };
     }

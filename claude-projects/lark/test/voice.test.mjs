@@ -51,21 +51,21 @@ test("VoiceTranscriber downloads, transcodes, recognizes, and cleans up", async 
       executable: "lark-cli",
       ffmpegExecutable: "ffmpeg",
       tempRoot: root,
-      run: async (file, args) => {
+      run: async (file, args, options) => {
         if (file === "ffmpeg") {
           transcodeSawDownload = fs.existsSync(args[args.indexOf("-i") + 1]);
           fs.writeFileSync(args[args.length - 1], Buffer.from("pcm"));
           return { code: 0, stdout: "", stderr: "" };
         }
         if (args.includes("api")) {
-          const body = JSON.parse(fs.readFileSync(args[args.indexOf("--data") + 1].replace(/^@/, ""), "utf8"));
+          const body = JSON.parse(fs.readFileSync(path.join(options.cwd, args[args.indexOf("--data") + 1].replace(/^@/, "")), "utf8"));
           assert.equal(body.config.format, "pcm");
           assert.equal(body.config.engine_type, "16k_auto");
           assert.match(body.config.file_id, /^[A-Za-z0-9_]{16}$/);
           recognizeSawPcm = Buffer.from(body.speech.speech, "base64").toString() === "pcm";
           return { code: 0, stdout: JSON.stringify({ ok: true, data: { recognition_text: "  继续修复第一项  " } }), stderr: "" };
         }
-        outputPath = args[args.indexOf("--output") + 1];
+        outputPath = path.join(options.cwd, args[args.indexOf("--output") + 1]);
         fs.writeFileSync(outputPath, Buffer.from("opus"));
         return { code: 0, stdout: JSON.stringify({ ok: true }), stderr: "" };
       },
@@ -108,8 +108,8 @@ test("VoiceTranscriber bounds the downloaded file and cleans up on failure", asy
       executable: "lark-cli",
       tempRoot: root,
       maxBytes: 2,
-      run: async (file, args) => {
-        const outputPath = args[args.indexOf("--output") + 1];
+      run: async (file, args, options) => {
+        const outputPath = path.join(options.cwd, args[args.indexOf("--output") + 1]);
         fs.writeFileSync(outputPath, Buffer.from("too large"));
         return { code: 0, stdout: "{}", stderr: "" };
       },
@@ -131,13 +131,13 @@ test("VoiceTranscriber surfaces recognition failure without leaking lark-cli out
       executable: "lark-cli",
       ffmpegExecutable: "ffmpeg",
       tempRoot: root,
-      run: async (file, args) => {
+      run: async (file, args, options) => {
         if (file === "ffmpeg") {
           fs.writeFileSync(args[args.length - 1], Buffer.from("pcm"));
           return { code: 0, stdout: "", stderr: "" };
         }
         if (args.includes("--output")) {
-          fs.writeFileSync(args[args.indexOf("--output") + 1], Buffer.from("opus"));
+          fs.writeFileSync(path.join(options.cwd, args[args.indexOf("--output") + 1]), Buffer.from("opus"));
           return { code: 0, stdout: "{}", stderr: "" };
         }
         return { code: 1, stdout: "", stderr: "secret internal detail" };
@@ -160,13 +160,13 @@ test("VoiceTranscriber reports a missing speech scope distinctly", async () => {
       executable: "lark-cli",
       ffmpegExecutable: "ffmpeg",
       tempRoot: root,
-      run: async (file, args) => {
+      run: async (file, args, options) => {
         if (file === "ffmpeg") {
           fs.writeFileSync(args[args.length - 1], Buffer.from("pcm"));
           return { code: 0, stdout: "", stderr: "" };
         }
         if (args.includes("--output")) {
-          fs.writeFileSync(args[args.indexOf("--output") + 1], Buffer.from("opus"));
+          fs.writeFileSync(path.join(options.cwd, args[args.indexOf("--output") + 1]), Buffer.from("opus"));
           return { code: 0, stdout: "{}", stderr: "" };
         }
         return {
@@ -198,7 +198,7 @@ test("VoiceTranscriber retries explicit rate limits without repeating download o
       ffmpegExecutable: "ffmpeg",
       tempRoot: root,
       sleep: async (delay) => { delays.push(delay); },
-      run: async (file, args) => {
+      run: async (file, args, options) => {
         if (file === "ffmpeg") {
           transcodes += 1;
           fs.writeFileSync(args[args.length - 1], Buffer.from("pcm"));
@@ -206,7 +206,7 @@ test("VoiceTranscriber retries explicit rate limits without repeating download o
         }
         if (args.includes("--output")) {
           downloads += 1;
-          fs.writeFileSync(args[args.indexOf("--output") + 1], Buffer.from("opus"));
+          fs.writeFileSync(path.join(options.cwd, args[args.indexOf("--output") + 1]), Buffer.from("opus"));
           return { code: 0, stdout: JSON.stringify({ ok: true }), stderr: "" };
         }
         recognitions += 1;
@@ -235,13 +235,13 @@ test("VoiceTranscriber reports a rate limit after bounded retries", async () => 
       ffmpegExecutable: "ffmpeg",
       tempRoot: root,
       sleep: async (delay) => { delays.push(delay); },
-      run: async (file, args) => {
+      run: async (file, args, options) => {
         if (file === "ffmpeg") {
           fs.writeFileSync(args[args.length - 1], Buffer.from("pcm"));
           return { code: 0, stdout: "", stderr: "" };
         }
         if (args.includes("--output")) {
-          fs.writeFileSync(args[args.indexOf("--output") + 1], Buffer.from("opus"));
+          fs.writeFileSync(path.join(options.cwd, args[args.indexOf("--output") + 1]), Buffer.from("opus"));
           return { code: 0, stdout: JSON.stringify({ ok: true }), stderr: "" };
         }
         recognitions += 1;
@@ -276,13 +276,13 @@ test("VoiceTranscriber does not retry rate limits without explicit retryable tru
         ffmpegExecutable: "ffmpeg",
         tempRoot: root,
         sleep: async () => { throw new Error("must not wait"); },
-        run: async (file, args) => {
+        run: async (file, args, options) => {
           if (file === "ffmpeg") {
             fs.writeFileSync(args[args.length - 1], Buffer.from("pcm"));
             return { code: 0, stdout: "", stderr: "" };
           }
           if (args.includes("--output")) {
-            fs.writeFileSync(args[args.indexOf("--output") + 1], Buffer.from("opus"));
+            fs.writeFileSync(path.join(options.cwd, args[args.indexOf("--output") + 1]), Buffer.from("opus"));
             return { code: 0, stdout: JSON.stringify({ ok: true }), stderr: "" };
           }
           recognitions += 1;
@@ -308,9 +308,9 @@ test("VoiceTranscriber reports transcode failure and cleans up", async () => {
       executable: "lark-cli",
       ffmpegExecutable: "ffmpeg",
       tempRoot: root,
-      run: async (file, args) => {
+      run: async (file, args, options) => {
         if (file === "ffmpeg") return { code: 1, stdout: "", stderr: "invalid data" };
-        fs.writeFileSync(args[args.indexOf("--output") + 1], Buffer.from("opus"));
+        fs.writeFileSync(path.join(options.cwd, args[args.indexOf("--output") + 1]), Buffer.from("opus"));
         return { code: 0, stdout: JSON.stringify({ ok: true }), stderr: "" };
       },
     });

@@ -1,4 +1,5 @@
 import { displaySessionName, matchSessionName } from "./session-name-match.mjs";
+import { candidateFailure, logLookupFailure, retrySnapshot } from "./lookup-observation.mjs";
 
 function projectForCandidate(candidate) {
   if (candidate?.project?.path && candidate?.project?.alias) return candidate.project;
@@ -9,6 +10,8 @@ function projectForCandidate(candidate) {
 }
 
 function candidateState(candidate) {
+  if (candidate.capability === "archived") return "已归档（需先取消归档）";
+  if (candidate.capability === "native_missing") return "原生记录已不存在";
   if (candidate.busy || candidate.capability === "busy") return "忙碌";
   if (candidate.capability && candidate.capability !== "ready") return `不可续接(${candidate.capability})`;
   return "可续接";
@@ -60,6 +63,13 @@ function projectCandidate(project) {
   };
 }
 
+const projectPathOrder = new Intl.Collator("zh-CN", { sensitivity: "base", numeric: true });
+function projectChoices(projects, details = {}) {
+  return [...projects]
+    .sort((left, right) => projectPathOrder.compare(left.path.replaceAll("/", "\\"), right.path.replaceAll("/", "\\")))
+    .map((project) => ({ ...projectCandidate(project), ...details }));
+}
+
 function executorCandidate(executor) {
   return {
     kind: "executor",
@@ -97,14 +107,17 @@ function generatedSessionName(content) {
 
 export function lookupFailureText(reason) {
   const messages = {
+    archived: "该 Codex Session 已归档，请先在本机取消归档（codex unarchive）后重试，未加入执行队列。",
+    native_missing: "该 Session 只剩 Gateway 记录，原生历史已不存在，无法续接。请指定其他会话或明确新建。",
     busy: "匹配的原生 Session 正在使用中，未创建同名新会话。",
+    off_work: "该请求被下班操作拦截，请在下班完成后重新发送任务。",
     project_unverified: "匹配到 Session，但无法验证其工程归属，未执行续接。",
     project_excluded: "匹配到 Session，但其工程位于排除目录中，未执行续接。",
     identity_conflict: "匹配到的 Session 存在身份冲突，需要先在本机处理。",
     name_claim_conflict: "该 Session 名称存在未解决的本地冲突，未执行操作。",
     name_in_use: "该 Session 名称已被其他会话使用，请重新发送以继续现有会话。",
     stale_target: "Session 状态已经变化，请重新发送会话名。",
-    snapshot_incomplete: "无法完整验证 Session 状态，未执行续接或新建。",
+    snapshot_incomplete: "暂时无法完整验证 Session 状态，已重试一次；未执行续接或新建，请稍后重试。",
     selection_expired: "候选列表已过期，请重新发送会话名。",
     selection_superseded: "此候选列表已被同一聊天中的新请求替代，请回复最新候选消息。",
   };
@@ -117,11 +130,17 @@ export function createSessionLookupService({
   scheduler,
   codexRoot,
   claudeRoot,
-  findNamedSession,
-  revalidateNativeCandidate,
+  findNamedSession: readNamedSession,
+  revalidateNativeCandidate: readNativeCandidate,
   sendGlobal,
   sendSession,
 }) {
+  const findNamedSession = options => retrySnapshot(() => readNamedSession(options));
+  const revalidateNativeCandidate = (candidate, options) => retrySnapshot(() => readNativeCandidate(candidate, options));
+  const failureReply = (messageId, reason, key, text = lookupFailureText(reason), executor = null) => {
+    logLookupFailure({ messageId, reason, executor: executor || store.getSessionLookup?.(messageId)?.executor });
+    return sendGlobal(text, `${key}-${reason}`);
+  };
   function firstPage(candidates, kind) {
     if (kind === "session-choice" && candidates.at(-1)?.kind === "create-new") {
       return [...candidates.slice(0, -1).slice(0, 9), candidates.at(-1)];
@@ -155,7 +174,7 @@ export function createSessionLookupService({
       claudeRoot,
     });
     if (!refreshed.complete) {
-      return sendGlobal(lookupFailureText("snapshot_incomplete"), `selection-refresh-incomplete-${message.message_id}`);
+      return failureReply(message.message_id, "snapshot_incomplete", `selection-refresh-incomplete-${message.message_id}`);
     }
     let exact = false;
     let items;
@@ -180,7 +199,7 @@ export function createSessionLookupService({
       kind: "session-choice",
       outbox: { dedupeKey: key, text: `[Gateway | - | - | -]\n${text}` },
     });
-    if (!replaced.ok) return sendGlobal(lookupFailureText(replaced.reason), `selection-refresh-failed-${message.message_id}`);
+    if (!replaced.ok) return failureReply(message.message_id, replaced.reason, `selection-refresh-failed-${message.message_id}`);
     return sendGlobal(text, key, {
       prequeued: true,
       candidateSetId: replaced.set.id,
@@ -222,7 +241,7 @@ export function createSessionLookupService({
 
   async function failLookup(messageId, reason, key, text = lookupFailureText(reason)) {
     store.failSessionLookup(messageId, reason);
-    return sendGlobal(text, key);
+    return failureReply(messageId, reason, key, text);
   }
 
   async function handleNamedLookup(resolved, message, retrying = false) {
@@ -260,7 +279,7 @@ export function createSessionLookupService({
     }
     if (resolved.projectQuery && found.projectMatch?.kind === "selection") {
       const projects = found.projectMatch.projects;
-      const candidates = projects.map(projectCandidate);
+      const candidates = projectChoices(projects);
       const key = `lookup-project-selection-${message.message_id}`;
       return createCandidatePrompt({
         messageId: message.message_id, candidates, kind: "project-choice", key,
@@ -285,14 +304,14 @@ export function createSessionLookupService({
     if (found.match.kind === "selected") {
       const candidate = found.match.selected;
       if (candidate.busy || candidate.capability !== "ready") {
-        const reason = candidate.busy ? "busy" : candidate.capability;
+        const reason = candidateFailure(candidate);
         return failLookup(message.message_id, reason, `lookup-unavailable-${message.message_id}`);
       }
       if (candidate.nativeId) {
         const checked = await revalidateNativeCandidate(candidate, { config, codexRoot, claudeRoot });
         if (!checked.ok) {
           if (!retrying && checked.reason === "stale_target") return handleNamedLookup(resolved, message, true);
-          return failLookup(message.message_id, checked.reason, `lookup-stale-${message.message_id}`);
+          return failLookup(message.message_id, checked.reason, `lookup-${checked.reason}-${message.message_id}`);
         }
       }
       const project = projectForCandidate(candidate);
@@ -307,7 +326,7 @@ export function createSessionLookupService({
         action: "continue",
         approvalProfile: resolved.approvalProfile,
       });
-      if (!committed.ok) return sendGlobal(lookupFailureText(committed.reason), `lookup-commit-${message.message_id}`);
+      if (!committed.ok) return failureReply(message.message_id, committed.reason, `lookup-commit-${message.message_id}`);
       return queueCommitted(committed);
     }
     const items = [createNewCandidate()];
@@ -385,7 +404,7 @@ export function createSessionLookupService({
       const projects = found.projectMatch.kind === "selection" ? found.projectMatch.projects : found.projects;
       if (!projects.length) return failLookup(message.message_id, "missing_project", `new-project-empty-${message.message_id}`,
         "没有可用于新建的已发现工程。");
-      const candidates = projects.map(projectCandidate);
+      const candidates = projectChoices(projects);
       const key = `new-project-selection-${message.message_id}`;
       return createCandidatePrompt({
         messageId: message.message_id, candidates, kind: "project-choice", key,
@@ -405,7 +424,7 @@ export function createSessionLookupService({
       action: "new",
       approvalProfile: resolved.approvalProfile,
     });
-    if (!committed.ok) return sendGlobal(lookupFailureText(committed.reason), `new-project-commit-${message.message_id}`);
+    if (!committed.ok) return failureReply(message.message_id, committed.reason, `new-project-commit-${message.message_id}`);
     return queueCommitted(committed);
   }
 
@@ -414,10 +433,10 @@ export function createSessionLookupService({
       return sendGlobal("请只回复候选列表中的编号。", `selection-invalid-${message.message_id}`);
     }
     if (binding.state === "superseded") {
-      return sendGlobal(lookupFailureText("selection_superseded"), `selection-superseded-${message.message_id}`);
+      return failureReply(message.message_id, "selection_superseded", `selection-superseded-${message.message_id}`);
     }
     if (!["open", "transitioned", "consumed"].includes(binding.state) || Number(binding.expires_at) <= Date.now()) {
-      return sendGlobal(lookupFailureText("selection_expired"), `selection-expired-${message.message_id}`);
+      return failureReply(message.message_id, "selection_expired", `selection-expired-${message.message_id}`);
     }
     const selectedIndex = Number(message.content.trim()) - 1;
     const candidate = binding.candidates[selectedIndex];
@@ -437,14 +456,14 @@ export function createSessionLookupService({
           candidates: executors,
           outbox: { dedupeKey: key, text: `[Gateway | - | - | -]\n${text}` },
         });
-        if (!transitioned.ok) return sendGlobal(lookupFailureText(transitioned.reason), `selection-executor-transition-${message.message_id}`);
+        if (!transitioned.ok) return failureReply(message.message_id, transitioned.reason, `selection-executor-transition-${message.message_id}`);
         return sendGlobal(text, key, {
           prequeued: true, candidateSetId: transitioned.set.id, candidatePageId: transitioned.set.page?.id,
         });
       }
       const creation = await creationSnapshot(binding.executor, binding.session_name, Boolean(binding.auto_name));
       if (!creation.ok && creation.reason === "snapshot_incomplete") {
-        return sendGlobal(lookupFailureText(creation.reason), `selection-new-incomplete-${message.message_id}`);
+        return failureReply(message.message_id, creation.reason, `selection-new-incomplete-${message.message_id}`);
       }
       if (!creation.ok) {
         return sendGlobal("已经出现同名 Session，请重新发送原命令以选择该会话。", `selection-new-name-${message.message_id}`);
@@ -469,12 +488,10 @@ export function createSessionLookupService({
           content: binding.content,
           action: "new",
         });
-        if (!committed.ok) return sendGlobal(lookupFailureText(committed.reason), `selection-new-commit-${message.message_id}`);
+        if (!committed.ok) return failureReply(message.message_id, committed.reason, `selection-new-commit-${message.message_id}`);
         return queueCommitted(committed);
       }
-      const projectItems = projects.map((project) => ({
-        ...projectCandidate(project), executor: binding.executor, name: creationName,
-      }));
+      const projectItems = projectChoices(projects, { executor: binding.executor, name: creationName });
       const key = `selection-new-projects-${binding.request_message_id}`;
       const text = formatProjectChoices(firstPage(projectItems, "project-choice").map((item) => item.project));
       const transitioned = store.transitionCandidateSet({
@@ -487,7 +504,7 @@ export function createSessionLookupService({
         candidates: projectItems,
         outbox: { dedupeKey: key, text: `[Gateway | - | - | -]\n${text}` },
       });
-      if (!transitioned.ok) return sendGlobal(lookupFailureText(transitioned.reason), `selection-new-transition-${message.message_id}`);
+      if (!transitioned.ok) return failureReply(message.message_id, transitioned.reason, `selection-new-transition-${message.message_id}`);
       return sendGlobal(text, key, {
         prequeued: true, candidateSetId: transitioned.set.id, candidatePageId: transitioned.set.page?.id,
       });
@@ -495,15 +512,13 @@ export function createSessionLookupService({
     if (candidate.kind === "executor") {
       const creation = await creationSnapshot(candidate.executor, binding.session_name, Boolean(binding.auto_name));
       if (!creation.ok && creation.reason === "snapshot_incomplete") {
-        return sendGlobal(lookupFailureText(creation.reason), `selection-executor-incomplete-${message.message_id}`);
+        return failureReply(message.message_id, creation.reason, `selection-executor-incomplete-${message.message_id}`);
       }
       if (!creation.ok) {
         return sendGlobal("已经存在同名 Session，请重新发送原命令以选择该会话。", `selection-executor-name-${message.message_id}`);
       }
       const refreshed = creation.found;
-      const projectItems = refreshed.projects.map((project) => ({
-        ...projectCandidate(project), executor: candidate.executor, name: creation.name,
-      }));
+      const projectItems = projectChoices(refreshed.projects, { executor: candidate.executor, name: creation.name });
       if (!projectItems.length) return sendGlobal("没有可用于新建的已发现工程。", `selection-executor-project-empty-${message.message_id}`);
       const key = `selection-executor-projects-${binding.request_message_id}`;
       const text = formatProjectChoices(firstPage(projectItems, "project-choice").map((item) => item.project));
@@ -517,7 +532,7 @@ export function createSessionLookupService({
         candidates: projectItems,
         outbox: { dedupeKey: key, text: `[Gateway | - | - | -]\n${text}` },
       });
-      if (!transitioned.ok) return sendGlobal(lookupFailureText(transitioned.reason), `selection-executor-project-${message.message_id}`);
+      if (!transitioned.ok) return failureReply(message.message_id, transitioned.reason, `selection-executor-project-${message.message_id}`);
       return sendGlobal(text, key, {
         prequeued: true, candidateSetId: transitioned.set.id, candidatePageId: transitioned.set.page?.id,
       });
@@ -535,13 +550,13 @@ export function createSessionLookupService({
         codexRoot,
         claudeRoot,
       });
-      if (!refreshed.complete) return sendGlobal(lookupFailureText("snapshot_incomplete"), `selection-project-stale-${message.message_id}`);
+      if (!refreshed.complete) return failureReply(message.message_id, "snapshot_incomplete", `selection-project-stale-${message.message_id}`);
       const project = refreshed.projects.find((item) => item.key === candidate.projectKey);
-      if (!project) return sendGlobal(lookupFailureText("stale_target"), `selection-project-missing-${message.message_id}`);
+      if (!project) return failureReply(message.message_id, "stale_target", `selection-project-missing-${message.message_id}`);
       const scopedMatch = matchSessionName(targetName, refreshed.candidates
         .filter((item) => item.projectPath?.toLowerCase() === project.path.toLowerCase()));
       if (scopedMatch.kind === "selected" || (scopedMatch.kind === "selection" && scopedMatch.exact)) {
-        return sendGlobal(lookupFailureText("stale_target"), `selection-project-name-${message.message_id}`);
+        return failureReply(message.message_id, "stale_target", `selection-project-name-${message.message_id}`);
       }
       if (!executor) return sendGlobal("没有找到同名 Session；新建前请指定 Codex 或 Claude。", `selection-project-executor-${message.message_id}`);
       const committed = store.commitCandidateTask({
@@ -556,7 +571,7 @@ export function createSessionLookupService({
         content: binding.content,
         action: "new",
       });
-      if (!committed.ok) return sendGlobal(lookupFailureText(committed.reason), `selection-project-commit-${message.message_id}`);
+      if (!committed.ok) return failureReply(message.message_id, committed.reason, `selection-project-commit-${message.message_id}`);
       if (committed.repeated) return sendGlobal("该候选已经处理。", `selection-project-repeat-${message.message_id}`);
       return queueCommitted(committed);
     }
@@ -565,7 +580,7 @@ export function createSessionLookupService({
     }
     const sessionCandidate = candidate.candidate;
     if (sessionCandidate.busy || sessionCandidate.capability !== "ready") {
-      return sendGlobal(lookupFailureText(sessionCandidate.busy ? "busy" : sessionCandidate.capability), `selection-unavailable-${message.message_id}`);
+      return failureReply(message.message_id, candidateFailure(sessionCandidate), `selection-unavailable-${message.message_id}`, undefined, sessionCandidate.executor);
     }
     if (sessionCandidate.nativeId) {
       const checked = await revalidateNativeCandidate(sessionCandidate, { config, codexRoot, claudeRoot });
@@ -573,11 +588,11 @@ export function createSessionLookupService({
         if (checked.reason === "stale_target") {
           return refreshSessionCandidates(binding, message, selectedIndex, candidate);
         }
-        return sendGlobal(lookupFailureText(checked.reason), `selection-stale-${message.message_id}`);
+        return failureReply(message.message_id, checked.reason, `selection-${checked.reason}-${message.message_id}`, undefined, sessionCandidate.executor);
       }
     }
     const project = projectForCandidate(sessionCandidate);
-    if (!project) return sendGlobal(lookupFailureText("project_unverified"), `selection-project-${message.message_id}`);
+    if (!project) return failureReply(message.message_id, "project_unverified", `selection-project-${message.message_id}`);
     const committed = store.commitCandidateTask({
       candidateSetId: binding.id,
       candidatePageId: binding.page_id,
@@ -589,7 +604,7 @@ export function createSessionLookupService({
       name: sessionCandidate.name,
       content: binding.content,
     });
-    if (!committed.ok) return sendGlobal(lookupFailureText(committed.reason), `selection-commit-${message.message_id}`);
+    if (!committed.ok) return failureReply(message.message_id, committed.reason, `selection-commit-${message.message_id}`);
     if (committed.repeated) return sendGlobal("该候选已经处理。", `selection-repeat-${message.message_id}`);
     return queueCommitted(committed);
   }

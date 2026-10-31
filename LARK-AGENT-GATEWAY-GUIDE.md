@@ -31,6 +31,13 @@ C:\Users\<UserName>\.agents\claude-projects\lark
 - 每条任务消息均包含：`执行器 | 项目 | Session Name | Session ID`。
 - 网关任务通过 `LARK_GATEWAY_MANAGED=1` 禁用已有通知 Hook，避免重复发送。
 
+Claude 任务已开启完整执行模式：终端命令、跨目录文件访问、已配置的 MCP 和技能均可使用，
+普通工具权限由 `bypassPermissions` 放行。原有会话下一次续接即可生效；例如发送
+`claude unityhub 继续打开 Unity 项目并检查 MCP`。这不会自动重放旧任务，也不会替代软件安装、
+服务启动或 Windows/管理员权限。排障时检查网关 `run/health.json` 中
+`claudeExecutionMode` 是否为 `full_access`。详细配置和回退方式见
+[网关 README](claude-projects/lark/README.md)。
+
 ## 2. 日常使用
 
 在飞书中私聊已配置的机器人，直接使用自然语言。
@@ -52,6 +59,12 @@ C:\Users\<UserName>\.agents\claude-projects\lark
 ```
 
 也可以回复某条带 Session 信息的机器人消息，网关会优先继续该消息绑定的 Session。
+
+升级后的 Codex / Claude 结束或中断通知也支持：使用飞书“回复”回复通知，输入
+“继续检查”或“按方案 A 执行”，即可按原生 Session ID 续接；回复数字也是该会话的
+任务内容。旧通知没有绑定时，请取消回复并发送 `codex/claude 会话名 任务内容`。
+正在占用的会话需先释放；Claude Code 进程即使空闲，也需先退出其持有的会话。
+通知回复不能用于批准原生客户端的权限弹窗。
 
 ### 2.3 查询与管理
 
@@ -188,16 +201,23 @@ Set-Location "$env:USERPROFILE\.agents\claude-projects\lark"
 
 ```powershell
 $SourceGateway = Join-Path $env:USERPROFILE ".agents\claude-projects\lark"
-$TransferGateway = "D:\Transfer\lark"
+$SourceSessionMgr = Join-Path $env:USERPROFILE ".agents\skills\session-mgr"
+$TransferRoot = Join-Path $env:USERPROFILE "agent-transfer"
+$TransferGateway = Join-Path $TransferRoot "claude-projects\lark"
+$TransferSessionMgr = Join-Path $TransferRoot "skills\session-mgr"
 
 Stop-ScheduledTask -TaskName "LarkClaudeGateway" -ErrorAction SilentlyContinue
 & (Join-Path $SourceGateway "scripts\stop.ps1")
 
 New-Item -ItemType Directory -Path $TransferGateway -Force | Out-Null
 robocopy $SourceGateway $TransferGateway /E /XD .git data logs run
+robocopy $SourceSessionMgr $TransferSessionMgr /E /XD .git node_modules
 ```
 
 `robocopy` 退出码 `0` 到 `7` 通常都表示复制完成；`8` 及以上表示失败。
+
+将整个 `agent-transfer` 目录带到目标电脑。项目概况、活动会话和 Claude 历史读取现由
+SessionMgr 提供；单独复制 Gateway 子目录会缺少运行依赖。
 
 默认不要复制：
 
@@ -208,6 +228,9 @@ robocopy $SourceGateway $TransferGateway /E /XD .git data logs run
 - Claude、Codex、飞书的 Token 或认证缓存。
 
 若确实需要保留历史列表，可以在网关完全停止后单独备份 `data/gateway.sqlite`。但只有同时迁移相应 Claude/Codex 原生 Session 存储时，旧 Session 才可能继续执行，因此不推荐作为普通迁移方案。
+
+`data/notification-bindings/` 保存本机新通知与原生 Session 的关联，也不随普通迁移复制。
+新电脑从新发送的通知重新建立关联；旧电脑的通知不能在新电脑自动续接。
 
 ### 5.2 目标电脑：准备运行环境
 
@@ -272,10 +295,16 @@ stderr 出现以下标记表示监听建立成功：
 ```powershell
 $TargetAgents = Join-Path $env:USERPROFILE ".agents"
 $TargetGateway = Join-Path $TargetAgents "claude-projects\lark"
+$TargetSessionMgr = Join-Path $TargetAgents "skills\session-mgr"
+$TransferRoot = Join-Path $env:USERPROFILE "agent-transfer"
 
 New-Item -ItemType Directory -Path $TargetGateway -Force | Out-Null
-robocopy "D:\Transfer\lark" $TargetGateway /E
+robocopy (Join-Path $TransferRoot "claude-projects\lark") $TargetGateway /E
+robocopy (Join-Path $TransferRoot "skills\session-mgr") $TargetSessionMgr /E
 ```
+
+安装前先运行 Gateway 的 `scripts/install-task.ps1 -DiscoveryOnly`，确认 SessionMgr
+依赖和本机可执行程序均可用；安装器会按仓库相对位置查找技能，无需填写新的绝对路径。
 
 不要使用会删除目标文件的 `/MIR`，除非已经人工确认目标目录中没有需要保留的内容。
 

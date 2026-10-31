@@ -55,6 +55,14 @@ test("relative executable paths resolve within the project root", () => {
   try {
     const config = loadConfig({ rootPath: root, configDirectory });
     assert.equal(config.gateway.executables.node, fs.realpathSync.native(path.join(binDirectory, "node.exe")));
+    assert.equal(config.gateway.claudeExecutionMode, "restricted");
+    const basePath = path.join(configDirectory, "gateway.json");
+    const base = JSON.parse(fs.readFileSync(basePath, "utf8"));
+    fs.writeFileSync(basePath, JSON.stringify({ ...base, claudeExecutionMode: "full_access" }));
+    assert.equal(loadConfig({ rootPath: root, configDirectory }).gateway.claudeExecutionMode, "full_access");
+    fs.writeFileSync(basePath, JSON.stringify({ ...base, claudeExecutionMode: "typo" }));
+    assert.throws(() => loadConfig({ rootPath: root, configDirectory }), /Unsupported Claude execution mode/);
+    fs.writeFileSync(basePath, JSON.stringify(base));
     fs.writeFileSync(path.join(configDirectory, "gateway.local.json"), JSON.stringify({
       executables: { node: "../outside.exe" },
     }));

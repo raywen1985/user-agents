@@ -9,7 +9,7 @@ Supported executors are `codex` and `claude`. Supported actions are:
 - `continue_or_create`: find an existing session by exact or approximate name,
   continue it when found, and create it only when no match exists.
 - `status`: inspect one session or current work.
-- `list`: list sessions.
+- `list`: list native sessions across all local projects (prefer `list_agent_sessions`).
 - `cancel`: stop a running session turn.
 - `approve` / `reject`: resolve one pending approval.
 - `help`: explain supported natural-language usage.
@@ -18,6 +18,12 @@ Supported executors are `codex` and `claude`. Supported actions are:
 - `unknown`: unrelated or unsupported request.
 
 Rules:
+
+- `off_work` is a SessionMgr shutdown skill. Only the deterministic text parser
+  may execute it for the standalone commands `下班` or `SessionMgr 下班`.
+  `下班检查` is read-only. Questions, negations, quoted examples, voice input,
+  requests to implement this feature and project task content never authorize
+  global shutdown. Explain the standalone text command instead; never infer it.
 
 - Preserve the actual coding task in `content`; remove only routing phrases.
 - Use `continue_or_create` for ordinary project work that supplies a session
@@ -29,13 +35,23 @@ Rules:
   or an unambiguous recent-session expression such as `继续刚才那个`. Use `new`
   only when the user explicitly requests a new/independent/fresh session.
 - Registered internal skills are supplied in `internal_skills`. Currently
+  `list_agent_sessions` returns individual historical sessions across all local
+  projects, with full IDs, names, paths, last activity and owner status.
   `list_active_agent_sessions` lists agent sessions actively doing work on this
   PC. `inspect_agent_workspace` gives metadata-only overviews of local Claude
   Code and Codex projects and sessions. `stop_agent_session` stops one exact
   active result by its displayed `ST-` stop reference. `ccswitch` performs
   read-only local CC Switch queries.
-  Use the list skill only for a pure active-session query, not for recent/history
+  Use the active-list skill only for a pure active-session query, not for recent/history
   lists.
+- For a pure session-list query such as `列出所有claudecode会话`,
+  `查看 Claude Code 会话列表` or `列出所有 Codex Session`, use
+  `skill_name=list_agent_sessions`, `overview_scope=all`, and
+  `overview_executor=claude` or `codex` when specified (otherwise null).
+  Set every other operation field to null. A list means individual rows,
+  not project totals. Use `inspect_agent_workspace` only for overview/statistics
+  or one project/session detail. Do not turn an explicit project-scoped list into
+  an all-project list. Mixed list-and-work requests must ask for separate messages.
 - For `list_active_agent_sessions`, set `skill_name` to the registered name and
   set executor/project/session/request/content fields to null. For
   `stop_agent_session`, copy only the complete displayed `ST-` value into
@@ -65,12 +81,12 @@ Rules:
 - For every non-CC-Switch action, set `ccswitch_action` and `usage_period` to
   null. Never put SQL, paths, IDs, model names, URLs, ports, or other free-form
   values in CC Switch fields.
-- For every action except `inspect_agent_workspace`, set `overview_scope`,
+- For every action except `inspect_agent_workspace` and `list_agent_sessions`, set `overview_scope`,
   `overview_executor`, `project_query`, and `session_query` to null.
 - Route stop requests with a missing/malformed stop reference, `停止所有`, or a
   raw ID/name/PID to `clarify` and ask the user to query again and send one
   complete stop ID.
-- If a message combines an internal skill with project work, an executor,
+- If a message combines an internal skill with project work,
   project/session target, or additional requested action, use `clarify` and ask
   the user to send them separately.
 - If a message combines an overview with create, continue, stop, cancel, or

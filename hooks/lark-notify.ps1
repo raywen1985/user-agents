@@ -1194,7 +1194,12 @@ function Get-CliEnvelopeResult
     }
     if ($ExitCode -eq 0 -and $null -ne $envelope -and (Get-PropertyValue $envelope "ok") -eq $true)
     {
-        return [pscustomobject]@{ State = "Sent"; Detail = "" }
+        $data = Get-PropertyValue $envelope "data"
+        return [pscustomobject]@{
+            State = "Sent"; Detail = ""
+            MessageId = [string](Get-PropertyValue $data "message_id")
+            ChatId = [string](Get-PropertyValue $data "chat_id")
+        }
     }
     if ($ExitCode -ne 0 -and $null -ne $envelope -and (Get-PropertyValue $envelope "ok") -eq $false)
     {
@@ -1208,6 +1213,107 @@ function Get-CliEnvelopeResult
         return [pscustomobject]@{ State = "AmbiguousFailure"; Detail = "$errorType`: $detail" }
     }
     return [pscustomobject]@{ State = "AmbiguousFailure"; Detail = $OutputText }
+}
+
+function Get-NotificationProjectEvidence
+{
+    param([object]$Payload, [string]$Source, [string]$SessionId)
+    try
+    {
+        $transcript = ConvertTo-NormalizedLocalPath ([string](Get-PropertyValue $Payload 'transcript_path'))
+        $nativeRoot = if ($Source -eq 'codex') { Join-Path (Get-CodexHome) 'sessions' } else {
+            $claudeRoot = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $env:USERPROFILE '.claude' }
+            Join-Path $claudeRoot 'projects'
+        }
+        if (-not $transcript -or -not (Test-PathWithinRoot -Path $transcript -Root $nativeRoot)) { return $null }
+        $file = Get-Item -LiteralPath $transcript -Force
+        if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $null }
+        foreach ($line in (Get-Content -LiteralPath $transcript -TotalCount 64 -Encoding UTF8))
+        {
+            try { $entry = $line | ConvertFrom-Json } catch { continue }
+            $envelope = if ($Source -eq 'codex') {
+                if ((Get-PropertyValue $entry 'type') -ne 'session_meta') { continue }
+                Get-PropertyValue $entry 'payload'
+            } else { $entry }
+            $id = if ($Source -eq 'codex') { Get-PropertyValue $envelope 'id' } else { Get-PropertyValue $envelope 'sessionId' }
+            if ([string]$id -ne $SessionId) { continue }
+            $cwd = ConvertTo-NormalizedLocalPath ([string](Get-PropertyValue $envelope 'cwd'))
+            if (-not $cwd -or -not (Test-Path -LiteralPath $cwd -PathType Container)) { continue }
+            foreach ($checkPath in @($cwd, (Split-Path -Parent $transcript))) {
+                $current = Get-Item -LiteralPath $checkPath -Force
+                while ($null -ne $current) {
+                    if ($current.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $null }
+                    $current = $current.Parent
+                }
+            }
+            return [pscustomobject]@{ projectPath = $cwd; projectAlias = (Split-Path -Leaf $cwd); sourcePath = $transcript }
+        }
+    } catch { return $null }
+    return $null
+}
+
+function Save-NotificationBinding
+{
+    param([object]$Result, [object]$Config, [string]$Source, [string]$SessionId, [object]$Payload = $null)
+
+    if ($Result.State -ne "Sent" -or (Get-PropertyValue $Config "identity") -ne "bot") { return }
+    $messageId = [string](Get-PropertyValue $Result "MessageId")
+    $chatId = [string](Get-PropertyValue $Result "ChatId")
+    $recipient = [string](Get-PropertyValue $Config "recipientOpenId")
+    if ($messageId -cnotmatch '^om_[A-Za-z0-9_-]{1,128}$' -or
+        $SessionId -notmatch '^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$' -or
+        $Source -cnotin @("codex", "claude") -or
+        $recipient -cnotmatch '^ou_[A-Za-z0-9_-]{1,128}$' -or
+        ($chatId -and $chatId -cnotmatch '^oc_[A-Za-z0-9_-]{1,128}$'))
+    {
+        Write-NotifyLog "Notification reply binding skipped: invalid or missing identity"
+        return
+    }
+    $directory = Join-Path $env:USERPROFILE ".agents\claude-projects\lark\data\notification-bindings"
+    $temporaryPath = $null
+    try
+    {
+        [IO.Directory]::CreateDirectory($directory) | Out-Null
+        $current = Get-Item -LiteralPath $directory -Force
+        while ($null -ne $current) {
+            if ($current.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'unsafe binding directory' }
+            $current = $current.Parent
+        }
+        $record = [ordered]@{
+            version = 1; messageId = $messageId; executor = $Source
+            nativeId = $SessionId.ToLowerInvariant(); recipientOpenId = $recipient
+            chatId = $chatId; createdAt = [DateTimeOffset]::UtcNow.ToString('o')
+        }
+        $projectEvidence = Get-NotificationProjectEvidence -Payload $Payload -Source $Source -SessionId $SessionId
+        if ($null -ne $projectEvidence) {
+            $record.version = 2
+            $record.projectPath = $projectEvidence.projectPath
+            $record.projectAlias = $projectEvidence.projectAlias
+            $record.projectSourcePath = $projectEvidence.sourcePath
+        }
+        $target = Join-Path $directory "$messageId.json"
+        $temporaryPath = Join-Path $directory (".{0}.tmp" -f [Guid]::NewGuid().ToString('N'))
+        [IO.File]::WriteAllText($temporaryPath, ($record | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+        try { [IO.File]::Move($temporaryPath, $target) }
+        catch
+        {
+            if (-not [IO.File]::Exists($target)) { throw }
+            $existing = [IO.File]::ReadAllText($target) | ConvertFrom-Json
+            foreach ($key in @("version", "messageId", "executor", "nativeId", "recipientOpenId", "chatId"))
+            {
+                if ([string](Get-PropertyValue $existing $key) -cne [string]$record[$key]) { throw 'binding conflict' }
+            }
+        }
+    }
+    catch { Write-NotifyLog "Notification reply binding failed: source=$Source messageId=$messageId" }
+    finally
+    {
+        try
+        {
+            if ($temporaryPath -and [IO.File]::Exists($temporaryPath)) { [IO.File]::Delete($temporaryPath) }
+        }
+        catch { Write-NotifyLog "Notification reply binding temporary file cleanup failed" }
+    }
 }
 
 function Invoke-LarkMessage
@@ -1380,12 +1486,14 @@ function Invoke-LarkNotification
     if ($null -eq $cardJson)
     {
         $fallbackResult = Invoke-LarkMessage -CliPath $larkCli -Config $config -MessageType text -Content $fallbackMessage -IdempotencyKey $keys.Fallback
+        Save-NotificationBinding -Result $fallbackResult -Config $config -Source $Source -SessionId $sessionId -Payload $Payload
         Write-NotifyLog "Text fallback result: source=$Source ingress=$ingress event=$typeLine state=$($fallbackResult.State) detail=$($fallbackResult.Detail)"
         return [pscustomobject]@{ Skipped = $false; State = $fallbackResult.State }
     }
     $cardResult = Invoke-LarkMessage -CliPath $larkCli -Config $config -MessageType interactive -Content $cardJson -IdempotencyKey $keys.Card
     if ($cardResult.State -eq "Sent")
     {
+        Save-NotificationBinding -Result $cardResult -Config $config -Source $Source -SessionId $sessionId -Payload $Payload
         Write-NotifyLog "Notification sent: source=$Source ingress=$ingress event=$typeLine project=$project"
         return [pscustomobject]@{ Skipped = $false; State = "Sent" }
     }
@@ -1395,6 +1503,7 @@ function Invoke-LarkNotification
         return [pscustomobject]@{ Skipped = $false; State = $cardResult.State }
     }
     $fallbackResult = Invoke-LarkMessage -CliPath $larkCli -Config $config -MessageType text -Content $fallbackMessage -IdempotencyKey $keys.Fallback
+    Save-NotificationBinding -Result $fallbackResult -Config $config -Source $Source -SessionId $sessionId -Payload $Payload
     Write-NotifyLog "Text fallback result: source=$Source ingress=$ingress event=$typeLine state=$($fallbackResult.State) detail=$($fallbackResult.Detail)"
     return [pscustomobject]@{ Skipped = $false; State = $fallbackResult.State }
 }

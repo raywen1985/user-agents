@@ -26,9 +26,11 @@ export class Scheduler {
     this.cancelFences = new Map();
     this.cancelPlans = new Map();
     this.knownTaskIds = new Set();
+    this.offWork = null;
   }
 
   enqueue(task, session, { defer = false } = {}) {
+    if (this.offWork) throw new Error("正在执行下班，请完成后重新发送任务。");
     if (this.cancelFences.has(session.id)) {
       const error = new Error("Session 正在停止，请稍后重试。");
       error.code = "SESSION_STOPPING";
@@ -42,6 +44,7 @@ export class Scheduler {
   }
 
   enqueueFactory(session, createTask, { defer = false } = {}) {
+    if (this.offWork) throw new Error("正在执行下班，请完成后重新发送任务。");
     if (this.cancelFences.has(session.id)) {
       const error = new Error("Session 正在停止，请稍后重试。");
       error.code = "SESSION_STOPPING";
@@ -73,7 +76,32 @@ export class Scheduler {
   }
 
   canEnqueue(sessionId) {
-    return !this.cancelFences.has(sessionId);
+    return !this.offWork && !this.cancelFences.has(sessionId);
+  }
+
+  beginOffWork() {
+    if (this.offWork) throw new Error("下班正在执行。");
+    const token = Symbol('off-work');
+    this.offWork = token;
+    this.store.taskAdmissionBlocked = true;
+    try {
+      this.reconcileQueuedTasks({ drain: false });
+      const sessionIds = new Set([...this.active.keys(), ...this.queue.map(entry => entry.session.id)]);
+      for (const id of sessionIds) this.cancel(id);
+    } catch (error) {
+      this.offWork = null;
+      this.store.taskAdmissionBlocked = false;
+      throw error;
+    }
+    return token;
+  }
+
+  endOffWork(token) {
+    if (this.offWork !== token) return false;
+    this.offWork = null;
+    this.store.taskAdmissionBlocked = false;
+    this.reconcileQueuedTasks();
+    return true;
   }
 
   exactActivity(sessionId) {
@@ -229,6 +257,7 @@ export class Scheduler {
   }
 
   #drain() {
+    if (this.offWork) return;
     while (this.runningProjects.size < this.maxConcurrentProjects) {
       const index = this.queue.findIndex((entry) => ![...this.runningProjects]
         .some((runningPath) => projectPathsConflict(runningPath, entry.session.project_path)));
@@ -324,8 +353,9 @@ export class Scheduler {
     });
     this.store.updateTask(task.id, "running");
     this.store.updateSession(session.id, { status: "running" });
-    await this.onMessage(session, "已开始处理。", `start-${task.id}`);
     try {
+      await this.onMessage(session, "已开始处理。", `start-${task.id}`);
+      if (abort.signal.aborted) throw Object.assign(new Error('Task cancelled before start'), { name: 'AbortError' });
       const executor = this.executors[session.executor];
       const result = await executor.run({
         session,

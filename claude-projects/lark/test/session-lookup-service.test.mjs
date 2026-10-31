@@ -69,6 +69,29 @@ test("a unique safe native match is imported and queued for continuation", () =>
   });
 });
 
+test("archived and missing native matches fail before task creation with the actual failure reason", async () => {
+  for (const capability of ["archived", "native_missing"]) {
+    const selected = candidate({ capability });
+    await withHarness(async () => ({ complete: true, match: { kind: "selected", selected } }), async h => {
+      await h.service.handleNamedLookup({ executor: "codex", name: "target", content: "work" }, { message_id: `om-${capability}` });
+      assert.equal(h.queued.length, 0); assert.equal(h.sessionMessages.length, 0);
+      assert.ok(h.globalMessages[0].key.includes(capability));
+    });
+  }
+});
+
+test("transient snapshot failure retries without duplicating task commit and busy failure is never labelled stale", async () => {
+  const selected = candidate(); let calls = 0;
+  await withHarness(async () => ++calls === 1 ? { complete: false } : { complete: true, match: { kind: "selected", selected } }, async h => {
+    await h.service.handleNamedLookup({ executor: "codex", name: "target", content: "work" }, { message_id: "om-retry" });
+    assert.equal(calls, 2); assert.equal(h.queued.length, 1);
+  });
+  await withHarness(async () => ({ complete: true, match: { kind: "selected", selected } }), async h => {
+    await h.service.handleNamedLookup({ executor: "codex", name: "target", content: "work" }, { message_id: "om-busy" });
+    assert.equal(h.queued.length, 0); assert.match(h.globalMessages[0].key, /busy/); assert.doesNotMatch(h.globalMessages[0].key, /stale/);
+  }, async () => ({ ok: false, reason: "busy" }));
+});
+
 test("ambiguous matches persist a bound candidate list and a numbered reply consumes it once", () => {
   const first = candidate();
   const second = candidate({
@@ -221,6 +244,32 @@ test("a no-match request binds a discovered project choice before creation", () 
     assert.equal(harness.queued[0].task.action, "new");
     assert.equal(harness.store.getProjectAuthority(harness.queued[0].session.id).native_id,
       discovered.authorities[0].nativeId);
+  });
+});
+
+test("new project choices sort full paths before paging and keep numbered selection bound to the displayed project", () => {
+  const projects = Array.from({ length: 12 }, (_, index) => {
+    const number = 12 - index;
+    const directory = path.join(os.tmpdir(), "project-order-fixture", `WA${number}`);
+    return { alias: `fixture-${number}`, label: `fixture-${number}`, display: `fixture-${number}`,
+      path: directory, key: directory.toLowerCase(), updatedAt: number,
+      authorities: [{ sourceType: "native", provider: "claude", nativeId: "77777777-7777-4777-8777-777777777777", sourcePath: path.join(os.tmpdir(), "history.jsonl") }] };
+  });
+  return withHarness(async () => ({ complete: true, projects,
+    projectMatch: { kind: "all", projects }, candidates: [], match: { kind: "none", matches: [] } }), async h => {
+    await h.service.handleNewLookup({ executor: "claude", name: "path-order", content: "work" }, { message_id: "om-order" });
+    const first = h.globalMessages[0];
+    assert.match(first.text, /\n1\. fixture-1 \|/);
+    assert.match(first.text, /\n10\. fixture-10 \|/);
+    assert.equal(projects[0].alias, "fixture-12");
+    h.store.bindCandidateMessage("om-order-first", first.options.candidateSetId, first.options.candidatePageId);
+    await h.service.handleCandidateNavigation(h.store.candidateSetForReply("om-order-first"), { message_id: "om-next" }, "next");
+    const second = h.globalMessages[1];
+    assert.match(second.text, /\n1\. fixture-11 \|/);
+    h.store.bindCandidateMessage("om-order-second", second.options.candidateSetId, second.options.candidatePageId);
+    await h.service.handleCandidateReply(h.store.candidateSetForReply("om-order-second"), { message_id: "om-order-select", content: "1" });
+    assert.equal(h.queued.length, 1);
+    assert.equal(h.queued[0].session.project_path, projects.find(p => p.alias === "fixture-11").path);
   });
 });
 
