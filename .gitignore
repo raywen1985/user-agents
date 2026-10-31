@@ -30,6 +30,7 @@
 
 # Runtime state
 /.tmp/
+/.sessionmgr/
 /.token-meter-data/
 /token-meter/model-prices.local.json
 /lark-auth-qr.png
