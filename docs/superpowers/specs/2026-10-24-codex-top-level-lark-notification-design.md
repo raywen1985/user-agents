@@ -115,6 +115,41 @@ direct bridge 所需的 native-state 存在、可信并与当前选定 native co
 官方 `notify`，将不再发送飞书消息；这是为保证单入口和消除重复通知接受的兼容性
 取舍。
 
+### Codex runtime 升级恢复
+
+Codex Desktop 升级可能先删除旧 `cua_node/<hash>` runtime，再将 `config.toml` 留在
+指向旧 `codex-computer-use.exe` 的 native-chain 状态。此时链的第一个进程无法启动，
+bridge 不会收到事件；旧逻辑又因 native 文件不存在而把整条链视为未知配置，导致
+周期自恢复持续失败。
+
+bootstrap 将“结构可信”与“当前可执行”分开判断。仅当以下条件全部满足时，缺失
+native 文件的链才可作为本功能管理的 stale chain 恢复：
+
+1. 命令严格为四项：native 路径、`turn-ended`、`--previous-notify`、previous JSON。
+2. native 文件名严格为 `codex-computer-use.exe`，规范化路径位于当前用户的
+   `%LOCALAPPDATA%/OpenAI/Codex/runtimes/cua_node` 下，并匹配官方固定后缀
+   `bin/node_modules/@oai/sky/bin/windows/codex-computer-use.exe`；仅缺少文件这一项。
+3. previous JSON 可解析为字符串数组，且 argv 必须完整匹配两种受管形式之一：
+   legacy canonical 为 `powershell.exe -NoLogo -NoProfile -NonInteractive
+   -ExecutionPolicy Bypass -File <bridge>`；marked canonical 只允许在其末尾固定增加
+   恰好一个 `-Chained`。不接受其他额外参数、重复 `-File`、替代宿主或仅“碰巧
+   引用”同一 bridge 的自定义 wrapper。
+4. 官方 runtime 根目录下存在新的可用 native 候选。候选必须通过固定官方后缀、
+   合理最小长度、`MZ` PE 文件头及短间隔两次长度/写入时间稳定性校验；最新候选
+   不合格时继续选择次新合格候选。
+
+恢复时先选择最新合格 native，原子更新 native-state，再把 TOML notify 写成受管
+native-chain。链内 previous bridge 增加固定 `-Chained` 开关，表示当前事件已经由
+native 处理。bridge 只依据本次 argv 的 `-Chained` 开关决定是否跳过 native，不再
+读取可变的全局 `config.toml` 猜测调用来源；direct bridge 不带该开关并调用
+native-state。现有受管但未带标记的 legacy chain 也一次性规范化为带标记 chain；
+已标记且 native 有效的 chain 保持字节与时间戳不变。
+若 native-state 或 TOML 任一步失败，保留/回滚原配置，不覆盖外部并发修改。
+
+任一结构条件不满足，或找不到新 native 时，继续以未知命令失败关闭，不覆盖配置。
+有效 chain 的行为不变；其 native-state 若仍指向旧 runtime，则刷新为当前 chain
+头部。`-CheckOnly` 对 stale chain 返回 `Healthy=false` 和待修复状态，但不写文件。
+
 ## 测试
 
 ### Bridge
@@ -141,6 +176,16 @@ direct bridge 所需的 native-state 存在、可信并与当前选定 native co
 - TOML 已写入后 Hook 停用写入失败时，未发生并发修改则回滚 TOML；发生并发修改则
   不覆盖外部编辑、报告不健康，并验证同一 Turn 的双入口仍生成相同幂等键。
 - 链式 notify 识别、未知链拒绝和原生状态刷新测试继续通过。
+- stale chain（可信旧路径已不存在、previous 精确匹配、存在新 native）可恢复，
+  `-CheckOnly` 不写文件，正式运行后 marked native-chain 和 native-state 均指向
+  可用实现。
+- stale chain 的 native 位于可信根外、后缀不匹配、previous 未知或没有新候选时拒绝
+  覆盖。有效 legacy chain 在 `-CheckOnly` 报 `WouldChange=true` 并规范化一次；有效
+  marked chain 不发生额外改写。
+- previous 虽引用同一 bridge，但宿主、参数数量/顺序或额外参数不符合规范时拒绝。
+- 最新 native 为零字节、截断、非 PE 或仍在写入时跳过，并回退到次新合格候选。
+- bridge 的 direct/chained 分支只由本次 `-Chained` argv 决定；测试在调用期间改写
+  `config.toml`，证明不会造成 native 丢失或重复。
 
 ### 回归
 
