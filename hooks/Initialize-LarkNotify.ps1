@@ -529,14 +529,50 @@ function Test-LNPathWithinRoot
     catch { return $false }
 }
 
-function Test-LNOfficialNativeNotify
+function Test-LNOfficialNativeNotifyShape
 {
     param([string[]]$Command, [string]$LocalRoot)
     if ($Command.Count -lt 2 -or $Command[1] -cne "turn-ended") { return $false }
     if ([IO.Path]::GetFileName($Command[0]) -cne "codex-computer-use.exe") { return $false }
     $trustedRoot = Join-Path $LocalRoot "OpenAI\Codex\runtimes\cua_node"
     return (Test-LNPathWithinRoot $Command[0] $trustedRoot) -and
-        (Test-Path -LiteralPath $Command[0] -PathType Leaf)
+        ($Command[0] -match '(?i)[\\/]bin[\\/]node_modules[\\/]@oai[\\/]sky[\\/]bin[\\/]windows[\\/]codex-computer-use\.exe$')
+}
+
+function Test-LNUsableNativeNotifyFile
+{
+    param([string]$Path)
+    try
+    {
+        $first = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if (-not $first.PSIsContainer -and $first.Length -ge 4096)
+        {
+            $stream = [IO.FileStream]::new(
+                $first.FullName,
+                [IO.FileMode]::Open,
+                [IO.FileAccess]::Read,
+                ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            )
+            try
+            {
+                if ($stream.ReadByte() -ne 0x4D -or $stream.ReadByte() -ne 0x5A) { return $false }
+            }
+            finally { $stream.Dispose() }
+            Start-Sleep -Milliseconds 50
+            $second = Get-Item -LiteralPath $Path -ErrorAction Stop
+            return $second.Length -eq $first.Length -and
+                $second.LastWriteTimeUtc.Ticks -eq $first.LastWriteTimeUtc.Ticks
+        }
+    }
+    catch {}
+    return $false
+}
+
+function Test-LNOfficialNativeNotify
+{
+    param([string[]]$Command, [string]$LocalRoot)
+    return (Test-LNOfficialNativeNotifyShape $Command $LocalRoot) -and
+        (Test-LNUsableNativeNotifyFile $Command[0])
 }
 
 function Test-LNOfficialCodexNotify
@@ -545,35 +581,70 @@ function Test-LNOfficialCodexNotify
     return $Command.Count -eq 2 -and (Test-LNOfficialNativeNotify $Command $LocalRoot)
 }
 
-function Test-LNChainedCodexNotify
+function Test-LNCommandSequence
 {
-    param([string[]]$Command, [string]$LocalRoot, [string]$BridgePath)
-    if ($Command.Count -ne 4 -or $Command[2] -cne "--previous-notify") { return $false }
-    if (-not (Test-LNOfficialNativeNotify $Command $LocalRoot)) { return $false }
-    try { $previous = $Command[3] | ConvertFrom-Json }
-    catch { return $false }
-    if ($null -eq $previous) { return $false }
-    return Test-LNCodexNotifyBridge ([string[]]@($previous)) $BridgePath
+    param([string[]]$Actual, [string[]]$Expected, [int]$PathIndex)
+    if ($Actual.Count -ne $Expected.Count) { return $false }
+    for ($index = 0; $index -lt $Expected.Count; $index++)
+    {
+        if ($index -eq $PathIndex)
+        {
+            try
+            {
+                if (-not [string]::Equals(
+                    [IO.Path]::GetFullPath($Actual[$index]),
+                    [IO.Path]::GetFullPath($Expected[$index]),
+                    [StringComparison]::OrdinalIgnoreCase)) { return $false }
+            }
+            catch { return $false }
+        }
+        elseif (-not [string]::Equals($Actual[$index], $Expected[$index], [StringComparison]::OrdinalIgnoreCase))
+        {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Get-LNBridgeNotifyKind
+{
+    param([string[]]$Command, [string]$BridgePath)
+    [string[]]$legacy = @(New-LNBridgeNotifyCommand $BridgePath)
+    if (Test-LNCommandSequence $Command $legacy 7) { return "Legacy" }
+    [string[]]$marked = @(New-LNBridgeNotifyCommand $BridgePath -Chained)
+    if (Test-LNCommandSequence $Command $marked 7) { return "Marked" }
+    return "Unknown"
 }
 
 function Test-LNCodexNotifyBridge
 {
     param([string[]]$Command, [string]$BridgePath)
-    if ($Command.Count -lt 2) { return $false }
-    $fileIndex = -1
-    for ($index = 0; $index -lt $Command.Count - 1; $index++)
-    {
-        if ($Command[$index] -ieq "-File") { $fileIndex = $index; break }
-    }
-    if ($fileIndex -lt 0 -or $fileIndex + 1 -ge $Command.Count) { return $false }
-    try
-    {
-        return [string]::Equals(
-            [IO.Path]::GetFullPath($Command[$fileIndex + 1]),
-            [IO.Path]::GetFullPath($BridgePath),
-            [StringComparison]::OrdinalIgnoreCase)
-    }
-    catch { return $false }
+    return (Get-LNBridgeNotifyKind $Command $BridgePath) -ne "Unknown"
+}
+
+function Get-LNChainedCodexNotifyInfo
+{
+    param([string[]]$Command, [string]$LocalRoot, [string]$BridgePath)
+    $result = [ordered]@{ Managed = $false; Kind = "Unknown"; NativeUsable = $false }
+    if ($Command.Count -ne 4 -or $Command[2] -cne "--previous-notify") { return [pscustomobject]$result }
+    if (-not (Test-LNOfficialNativeNotifyShape $Command $LocalRoot)) { return [pscustomobject]$result }
+    try { $parsedPrevious = $Command[3] | ConvertFrom-Json }
+    catch { return [pscustomobject]$result }
+    if ($parsedPrevious -isnot [Array]) { return [pscustomobject]$result }
+    [string[]]$previous = $parsedPrevious
+    $kind = Get-LNBridgeNotifyKind $previous $BridgePath
+    if ($kind -eq "Unknown") { return [pscustomobject]$result }
+    $result.Managed = $true
+    $result.Kind = $kind
+    $result.NativeUsable = Test-LNUsableNativeNotifyFile $Command[0]
+    return [pscustomobject]$result
+}
+
+function Test-LNChainedCodexNotify
+{
+    param([string[]]$Command, [string]$LocalRoot, [string]$BridgePath)
+    $info = Get-LNChainedCodexNotifyInfo $Command $LocalRoot $BridgePath
+    return $info.Managed -and $info.NativeUsable -and $info.Kind -eq "Marked"
 }
 
 function Find-LNLatestNativeNotify
@@ -583,8 +654,8 @@ function Find-LNLatestNativeNotify
     if (-not (Test-Path -LiteralPath $trustedRoot -PathType Container)) { return @() }
     $matches = Get-ChildItem -LiteralPath $trustedRoot -Filter "codex-computer-use.exe" -File -Recurse -ErrorAction SilentlyContinue |
         Where-Object {
-            (Test-LNPathWithinRoot $_.FullName $trustedRoot) -and
-            $_.FullName -match '(?i)[\\/]bin[\\/]node_modules[\\/]@oai[\\/]sky[\\/]bin[\\/]windows[\\/]codex-computer-use\.exe$'
+            (Test-LNOfficialNativeNotifyShape (@($_.FullName, "turn-ended")) $LocalRoot) -and
+            (Test-LNUsableNativeNotifyFile $_.FullName)
         } |
         Sort-Object @{ Expression = { $_.LastWriteTimeUtc }; Descending = $true }, @{ Expression = { $_.FullName }; Descending = $true }
     $match = $matches | Select-Object -First 1
@@ -594,11 +665,20 @@ function Find-LNLatestNativeNotify
 
 function New-LNBridgeNotifyCommand
 {
-    param([string]$BridgePath)
-    return @(
+    param([string]$BridgePath, [switch]$Chained)
+    $command = @(
         "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
         "-ExecutionPolicy", "Bypass", "-File", $BridgePath
     )
+    if ($Chained) { $command += "-Chained" }
+    return $command
+}
+
+function New-LNChainedCodexNotifyCommand
+{
+    param([string[]]$NativeCommand, [string]$BridgePath)
+    $previous = @(New-LNBridgeNotifyCommand $BridgePath -Chained) | ConvertTo-Json -Compress
+    return @($NativeCommand[0], "turn-ended", "--previous-notify", $previous)
 }
 
 function ConvertTo-LNTomlArray
@@ -633,23 +713,31 @@ function Update-LNTomlNotifyFile
         $hasBom = $originalBytes.Length -ge 3 -and $originalBytes[0] -eq 0xEF -and $originalBytes[1] -eq 0xBB -and $originalBytes[2] -eq 0xBF
         $text = if ($exists) { [Text.Encoding]::UTF8.GetString($originalBytes).TrimStart([char]0xFEFF) } else { "" }
         $info = Get-LNTomlNotifyInfo $text
-        $isBridge = Test-LNCodexNotifyBridge $info.Command $BridgePath
-        $isChained = Test-LNChainedCodexNotify $info.Command $LocalRoot $BridgePath
-        if ($info.Exists -and ($isBridge -or $isChained))
+        $bridgeKind = Get-LNBridgeNotifyKind $info.Command $BridgePath
+        $isDirectBridge = $bridgeKind -eq "Legacy"
+        $chainInfo = Get-LNChainedCodexNotifyInfo $info.Command $LocalRoot $BridgePath
+        $isHealthyChain = $chainInfo.Managed -and $chainInfo.NativeUsable -and $chainInfo.Kind -eq "Marked"
+        if ($info.Exists -and $isHealthyChain)
         {
-            $nativeCommand = if ($isChained) { @($info.Command[0], $info.Command[1]) } else { @() }
             return [pscustomobject]@{
                 Path = $Path; Changed = $false; WouldChange = $false; Created = $false
-                NativeCommand = $nativeCommand; Chained = $isChained
+                NativeCommand = @($info.Command[0], $info.Command[1]); Chained = $true
             }
         }
-        if ($info.Exists -and -not (Test-LNOfficialCodexNotify $info.Command $LocalRoot))
+        $isOfficialDirect = Test-LNOfficialCodexNotify $info.Command $LocalRoot
+        if ($info.Exists -and -not ($isDirectBridge -or $chainInfo.Managed -or $isOfficialDirect))
         {
             throw "Refusing to overwrite unknown Codex notify command in $Path."
         }
-        $nativeCommand = if ($info.Exists) { @($info.Command) } else { @(Find-LNLatestNativeNotify $LocalRoot) }
+        $nativeCommand = if ($isOfficialDirect) {
+            @($info.Command)
+        } elseif ($chainInfo.Managed -and $chainInfo.NativeUsable) {
+            @($info.Command[0], $info.Command[1])
+        } else {
+            @(Find-LNLatestNativeNotify $LocalRoot)
+        }
         if ($nativeCommand.Count -lt 2) { throw "Codex native notify command was not found under the trusted runtime root." }
-        $desiredLine = "notify = " + (ConvertTo-LNTomlArray (New-LNBridgeNotifyCommand $BridgePath))
+        $desiredLine = "notify = " + (ConvertTo-LNTomlArray (New-LNChainedCodexNotifyCommand $nativeCommand $BridgePath))
         $newline = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
         if ($info.Exists)
         {
@@ -666,7 +754,7 @@ function Update-LNTomlNotifyFile
         [void](Get-LNTomlNotifyInfo $candidate)
         if ($CheckOnly)
         {
-            return [pscustomobject]@{ Path = $Path; Changed = $false; WouldChange = $true; Created = -not $exists; NativeCommand = $nativeCommand; Chained = $false }
+            return [pscustomobject]@{ Path = $Path; Changed = $false; WouldChange = $true; Created = -not $exists; NativeCommand = $nativeCommand; Chained = $true }
         }
         try
         {
@@ -690,7 +778,7 @@ function Update-LNTomlNotifyFile
                 Copy-LNAcl $Path $backupPath
             }
             else { [IO.File]::Move($tempPath, $Path) }
-            return [pscustomobject]@{ Path = $Path; Changed = $true; WouldChange = $true; Created = -not $exists; NativeCommand = $nativeCommand; Chained = $false }
+            return [pscustomobject]@{ Path = $Path; Changed = $true; WouldChange = $true; Created = -not $exists; NativeCommand = $nativeCommand; Chained = $true }
         }
         catch
         {

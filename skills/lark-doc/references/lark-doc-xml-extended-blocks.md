@@ -50,7 +50,7 @@
 ## OKR block
 `<okr cycle-id="CYCLE_ID"></okr>`：创建时仅支持 root-only。
 
-OKR block 可用 XML 格式完整表达。创建前先参考 [`lark-okr`](../../lark-okr/SKILL.md) 确认可用周期；创建时只写 root-only `<okr cycle-id="..."/>` 挂载已有 OKR，不构造 Objective/KR/Progress 子树。
+OKR block 可用 XML 格式完整表达。仅在用户提供已确认有效的 `cycle-id` 时创建；周期查询与 OKR 管理能力已卸载，不猜测周期 ID；创建时只写 root-only `<okr cycle-id="..."/>` 挂载已有 OKR，不构造 Objective/KR/Progress 子树。
 
 获取时，XML 结构示例如下：
 

@@ -1,5 +1,9 @@
 [CmdletBinding()]
-param([switch]$ReplaceClaudeStatusLine, [switch]$SkipCodexValidation)
+param(
+    [switch]$ReplaceClaudeStatusLine,
+    [switch]$SkipCodexValidation,
+    [switch]$SkipVersionProbe
+)
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'TokenMeter.psm1') -Force
 
@@ -141,6 +145,6 @@ $manifest['state'] = 'configured_unverified'
 $manifest['last_validated_at'] = [DateTimeOffset]::Now.ToString('o')
 Write-TMAtomicJson $paths.Manifest $manifest
 
-$claudeVersion = (& claude --version 2>$null) -join ' '
-$codexVersion = (& codex --version 2>$null) -join ' '
+$claudeVersion = if ($SkipVersionProbe) { 'not-probed' } else { (& claude --version 2>$null) -join ' ' }
+$codexVersion = if ($SkipVersionProbe) { 'not-probed' } else { (& codex --version 2>$null) -join ' ' }
 [pscustomobject]@{Status='configured_unverified';Claude=$claudeVersion;Codex=$codexVersion;DataRoot=$paths.DataRoot;History=$paths.History} | Format-List

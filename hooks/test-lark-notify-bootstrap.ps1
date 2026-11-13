@@ -74,7 +74,10 @@ function New-TestProfile
     Set-Content -LiteralPath $fakeCli -Value "test" -Encoding ASCII
     $nativeNotify = Join-Path $local "OpenAI\Codex\runtimes\cua_node\test-runtime\bin\node_modules\@oai\sky\bin\windows\codex-computer-use.exe"
     [IO.Directory]::CreateDirectory((Split-Path -Parent $nativeNotify)) | Out-Null
-    Set-Content -LiteralPath $nativeNotify -Value "test" -Encoding ASCII
+    [byte[]]$nativeBytes = [byte[]]::new(4096)
+    $nativeBytes[0] = 0x4D
+    $nativeBytes[1] = 0x5A
+    [IO.File]::WriteAllBytes($nativeNotify, $nativeBytes)
     return [pscustomobject]@{ Profile = $profile; Local = $local; Cli = $fakeCli; NativeNotify = $nativeNotify }
 }
 
@@ -126,7 +129,13 @@ try
     Assert-True (Test-Path $codexTomlPath) "Codex TOML created"
     Assert-True (Test-Path $nativeStatePath) "native notify state created"
     $tomlInfo = Get-LNTomlNotifyInfo (Get-Content -Raw $codexTomlPath)
-    Assert-True (Test-LNCodexNotifyBridge $tomlInfo.Command (Join-Path $fresh.Profile ".agents\hooks\Invoke-CodexNotifyBridge.ps1")) "Codex notify bridge configured"
+    Assert-True (Test-LNOfficialNativeNotifyShape $tomlInfo.Command $fresh.Local) "fresh Codex native shape trusted"
+    [string[]]$freshPrevious = $tomlInfo.Command[3] | ConvertFrom-Json
+    Assert-Equals (Get-LNBridgeNotifyKind $freshPrevious (Join-Path $fresh.Profile ".agents\hooks\Invoke-CodexNotifyBridge.ps1")) "Marked" "fresh previous command marked"
+    $freshChain = Get-LNChainedCodexNotifyInfo $tomlInfo.Command $fresh.Local (Join-Path $fresh.Profile ".agents\hooks\Invoke-CodexNotifyBridge.ps1")
+    Assert-True $freshChain.Managed "fresh Codex notify chain owned"
+    Assert-Equals $freshChain.Kind "Marked" "fresh Codex notify chain marked"
+    Assert-True $freshChain.NativeUsable "fresh Codex native usable"
     $nativeState = Get-Content -Raw $nativeStatePath | ConvertFrom-Json
     Assert-Equals $nativeState.command[0] $fresh.NativeNotify "native notify executable preserved"
     Assert-Equals $nativeState.command[1] "turn-ended" "native notify argument preserved"
@@ -165,20 +174,52 @@ try
     [void](Invoke-TestBootstrap $chained)
     $chainedTomlPath = Join-Path $chained.Profile ".codex\config.toml"
     $chainedBridge = Join-Path $chained.Profile ".agents\hooks\Invoke-CodexNotifyBridge.ps1"
-    $chainedPrevious = @("powershell.exe", "-File", $chainedBridge) | ConvertTo-Json -Compress
+    $chainedPrevious = @(New-LNBridgeNotifyCommand $chainedBridge) | ConvertTo-Json -Compress
     $chainedLine = "notify = ['$($chained.NativeNotify)', ""turn-ended"", ""--previous-notify"", '$chainedPrevious']"
     Set-Content -LiteralPath $chainedTomlPath -Value $chainedLine -Encoding UTF8 -NoNewline
     $chainedTime = (Get-Item $chainedTomlPath).LastWriteTimeUtc
     Start-Sleep -Milliseconds 1100
+    $legacyCheck = Invoke-TestBootstrap $chained -CheckOnly
+    Assert-False $legacyCheck.Healthy "legacy chain requires normalization"
+    Assert-Equals (Get-Item $chainedTomlPath).LastWriteTimeUtc.Ticks $chainedTime.Ticks "legacy check-only leaves TOML timestamp unchanged"
     $chainedResult = Invoke-TestBootstrap $chained
-    Assert-True $chainedResult.Healthy "chained notify reports healthy"
-    Assert-True $chainedResult.CodexNotifyChained "chained notify detected"
-    Assert-False $chainedResult.CodexNotifyChanged "chained notify left untouched"
-    Assert-False $chainedResult.NativeNotifyChanged "chained native state unchanged"
-    Assert-Equals (Get-Item $chainedTomlPath).LastWriteTimeUtc.Ticks $chainedTime.Ticks "chained TOML timestamp unchanged"
-    Assert-Equals (Get-Content -Raw $chainedTomlPath).Trim() $chainedLine.Trim() "chained TOML content unchanged"
+    Assert-True $chainedResult.Healthy "normalized chain reports healthy"
+    Assert-True $chainedResult.CodexNotifyChained "normalized chain detected"
+    Assert-True $chainedResult.CodexNotifyChanged "legacy chain normalized once"
+    Assert-False $chainedResult.NativeNotifyChanged "legacy chain native state unchanged"
+    $normalizedLine = (Get-Content -Raw $chainedTomlPath).Trim()
+    $normalizedInfo = Get-LNTomlNotifyInfo $normalizedLine
+    Assert-True (Test-LNChainedCodexNotify $normalizedInfo.Command $chained.Local $chainedBridge) "normalized chain is marked"
+    $normalizedTime = (Get-Item $chainedTomlPath).LastWriteTimeUtc
+    Start-Sleep -Milliseconds 1100
     $chainedCheck = Invoke-TestBootstrap $chained -CheckOnly
     Assert-True $chainedCheck.Healthy "chained check-only healthy"
+    $chainedStable = Invoke-TestBootstrap $chained
+    Assert-False $chainedStable.CodexNotifyChanged "marked chain left untouched"
+    Assert-Equals (Get-Item $chainedTomlPath).LastWriteTimeUtc.Ticks $normalizedTime.Ticks "marked chain timestamp unchanged"
+
+    $stale = New-TestProfile "stale-chain"
+    $staleTomlPath = Join-Path $stale.Profile ".codex\config.toml"
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $staleTomlPath)) | Out-Null
+    $staleBridge = Join-Path $stale.Profile ".agents\hooks\Invoke-CodexNotifyBridge.ps1"
+    $staleNative = Join-Path $stale.Local "OpenAI\Codex\runtimes\cua_node\removed-runtime\bin\node_modules\@oai\sky\bin\windows\codex-computer-use.exe"
+    $stalePrevious = @(New-LNBridgeNotifyCommand $staleBridge -Chained) | ConvertTo-Json -Compress
+    $staleLine = "notify = ['$staleNative', ""turn-ended"", ""--previous-notify"", '$stalePrevious']"
+    Set-Content -LiteralPath $staleTomlPath -Value $staleLine -Encoding UTF8 -NoNewline
+    $invalidNative = Join-Path $stale.Local "OpenAI\Codex\runtimes\cua_node\newer-invalid\bin\node_modules\@oai\sky\bin\windows\codex-computer-use.exe"
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $invalidNative)) | Out-Null
+    [IO.File]::WriteAllBytes($invalidNative, [byte[]]::new(4096))
+    (Get-Item $invalidNative).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(1)
+    $staleCheck = Invoke-TestBootstrap $stale -CheckOnly
+    Assert-False $staleCheck.Healthy "stale chain check-only reports repair"
+    Assert-Equals (Get-Content -Raw $staleTomlPath).Trim() $staleLine.Trim() "stale check-only leaves TOML unchanged"
+    $staleResult = Invoke-TestBootstrap $stale
+    Assert-True $staleResult.CodexNotifyChanged "stale chain repaired"
+    $staleInfo = Get-LNTomlNotifyInfo (Get-Content -Raw $staleTomlPath)
+    Assert-Equals $staleInfo.Command[0] $stale.NativeNotify "invalid newer native skipped"
+    Assert-True (Test-LNChainedCodexNotify $staleInfo.Command $stale.Local $staleBridge) "stale chain repaired to marked chain"
+    $staleState = Get-Content -Raw (Join-Path $stale.Local "lark-notify\codex-native-notify.json") | ConvertFrom-Json
+    Assert-Equals $staleState.command[0] $stale.NativeNotify "stale native state refreshed"
 
     $unknownChain = New-TestProfile "unknown-chain"
     [void](Invoke-TestBootstrap $unknownChain)
@@ -186,6 +227,15 @@ try
     $unknownLine = "notify = ['$($unknownChain.NativeNotify)', ""turn-ended"", ""--previous-notify"", '[""powershell.exe"",""-File"",""C:\\temp\\other.ps1""]']"
     Set-Content -LiteralPath $unknownTomlPath -Value $unknownLine -Encoding UTF8 -NoNewline
     Assert-Throws { Invoke-TestBootstrap $unknownChain } "unknown chained previous notify refused"
+
+    $wrappedChain = New-TestProfile "wrapped-chain"
+    [void](Invoke-TestBootstrap $wrappedChain)
+    $wrappedTomlPath = Join-Path $wrappedChain.Profile ".codex\config.toml"
+    $wrappedBridge = Join-Path $wrappedChain.Profile ".agents\hooks\Invoke-CodexNotifyBridge.ps1"
+    $wrappedPrevious = @("custom-wrapper.exe", "-File", $wrappedBridge, "--custom-action") | ConvertTo-Json -Compress
+    $wrappedLine = "notify = ['$($wrappedChain.NativeNotify)', ""turn-ended"", ""--previous-notify"", '$wrappedPrevious']"
+    Set-Content -LiteralPath $wrappedTomlPath -Value $wrappedLine -Encoding UTF8 -NoNewline
+    Assert-Throws { Invoke-TestBootstrap $wrappedChain } "custom wrapper referencing bridge refused"
 
     $complex = New-TestProfile "complex"
     [IO.Directory]::CreateDirectory((Join-Path $complex.Profile ".claude")) | Out-Null

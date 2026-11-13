@@ -111,13 +111,17 @@ exit 0
     $previousNotify = @("powershell.exe", "-File", $bridgePath) | ConvertTo-Json -Compress
     $chainedLine = "notify = ['$nativePath', ""turn-ended"", ""--previous-notify"", '$previousNotify']"
     Set-Content -LiteralPath (Join-Path $codexHome "config.toml") -Value $chainedLine -Encoding UTF8 -NoNewline
-    $chainedDry = Invoke-CodexNotifyBridge -PayloadJson $payload -UserProfilePath $profile -LocalAppDataPath $local -DryRun
-    Assert-True $chainedDry.Chained "chained Codex notify detected"
-    $chainedLive = Invoke-CodexNotifyBridge -PayloadJson $payload -UserProfilePath $profile -LocalAppDataPath $local
+    $directDespiteConfig = Invoke-CodexNotifyBridge -PayloadJson $payload -UserProfilePath $profile -LocalAppDataPath $local -DryRun
+    Assert-True (-not $directDespiteConfig.Chained) "direct invocation ignores chained global config"
+    Assert-Equals $directDespiteConfig.Native "Planned" "direct invocation preserves native despite chained global config"
+    Set-Content -LiteralPath (Join-Path $codexHome "config.toml") -Value 'notify = ["powershell.exe"]' -Encoding UTF8 -NoNewline
+    $chainedDry = Invoke-CodexNotifyBridge -PayloadJson $payload -UserProfilePath $profile -LocalAppDataPath $local -Chained -DryRun
+    Assert-True $chainedDry.Chained "chained invocation follows argv marker"
+    $chainedLive = Invoke-CodexNotifyBridge -PayloadJson $payload -UserProfilePath $profile -LocalAppDataPath $local -Chained
     Assert-Equals $chainedLive.Native "ChainedSkipped" "native notify skipped when chained"
     Assert-Equals $chainedLive.Lark "Completed" "lark branch completes when chained"
 
-    $chainedMissing = Invoke-CodexNotifyBridge -PayloadJson ($missingPayload | ConvertTo-Json -Compress) -UserProfilePath $profile -LocalAppDataPath $local -DryRun
+    $chainedMissing = Invoke-CodexNotifyBridge -PayloadJson ($missingPayload | ConvertTo-Json -Compress) -UserProfilePath $profile -LocalAppDataPath $local -Chained -DryRun
     Assert-Equals $chainedMissing.Reason "non-top-level-codex-session" "chained transcript-only event skipped"
     Assert-Equals $chainedMissing.Native "ChainedSkipped" "chained native is not repeated for transcript-only event"
     Assert-Equals $chainedMissing.Lark "Skipped" "chained transcript-only event does not reach lark"

@@ -150,4 +150,4 @@ lark-cli api PATCH /open-apis/im/v1/chats/oc_xxx/announcement \
 ## 参考
 
 - [lark-shared](../lark-shared/SKILL.md) — 认证和全局参数
-- [lark-skill-maker](../lark-skill-maker/SKILL.md) — 如需将挖掘到的 API 固化为新 Skill
+- [skill-creator](../skill-creator/SKILL.md) — 用户要求将已验证的 API 操作固化为新 Skill 时，使用通用技能创建流程

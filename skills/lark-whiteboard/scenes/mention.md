@@ -8,7 +8,7 @@
 
 - 本页只讲 @用户（mentionUser）。@文档（mentionDoc）暂不支持。
 - `mentionUserId` 必须是**真实的飞书用户 open_id**（形如 `ou_xxxxxxxx`）。
-- 用户只给出**姓名**时，先用 `lark-contact` skill 把姓名解析成 open_id，再填入 `mentionUserId`。
+- `mentionUserId` 使用用户提供或可信已有记录中的 open_id。通讯录查询技能已卸载；用户只给出**姓名**时，请用户提供对应 open_id。
 - **无法解析出真实 open_id 时，停下向用户确认，禁止臆造 id**。假 id 会写入失败或 @ 到错误的人。
 
 ## Content 约束（关键）
@@ -68,4 +68,4 @@
 - **content 为空**：mention 静默丢失，画板上看不到 @用户。必须填 `"*"`。
 - **把用户名写进 content**：无意义，显示名由 open_id 反查决定；且多字符会占用多个字符位。
 - **mentionUserId + hyperlink 同 run**：一个 run 只能是一种元素类型，会被校验拦截，须拆成两个 run。
-- **用假 id 或用户中文名当 id**：`mentionUserId` 只接受真实 open_id，先经 `lark-contact` 解析。
+- **用假 id 或用户中文名当 id**：`mentionUserId` 只接受真实 open_id；缺少可信 ID 时先向用户确认，不用姓名替代。

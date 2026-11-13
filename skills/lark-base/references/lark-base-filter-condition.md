@@ -127,7 +127,7 @@ location 筛选只按 `full_address` 字符串匹配，不能直接按经纬度�
 
 ### `user` / `group_chat` / `created_by` / `updated_by`
 
-用对象数组；人员使用 `ou_xxx`，群组使用 `oc_xxx`。不知道 ID 时，人员用 `lark-contact` 查询，群组用 `lark-im` 搜索。
+用对象数组；人员使用 `ou_xxx`，群组使用 `oc_xxx`。人员 ID 须来自用户提供或可信已有记录；通讯录查询技能已卸载，仅有姓名时请用户提供对应 open_id，不猜测。群组可用 `lark-im` 搜索。
 
 ```json
 ["负责人", "intersects", [{ "id": "ou_xxx" }]]

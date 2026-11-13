@@ -14,6 +14,8 @@
 
 锁文件不是当前文件状态证明。Skill 安装后可能已有本地修改，因此升级、替换或删除锁文件登记项前，必须先检查实际 Git 差异。
 
+`handoff` 通过 Codex 技能安装器接入，未登记在 `.skill-lock.json`；来源为 [mattpocock/skills](https://github.com/mattpocock/skills/tree/4ae2317ddb22b046e26455e4f9c9b3aaaf62212d/skills/productivity/handoff)。保留上游文件；升级时须继续保留 `SKILL.md` 中的 `disable-model-invocation: true` 和 `agents/openai.yaml` 中的 `allow_implicit_invocation: false`，确保 Claude Code 与 Codex 均仅手动调用。
+
 ## 目录约定
 
 每个顶层 Skill 使用独立目录，最小结构为：
